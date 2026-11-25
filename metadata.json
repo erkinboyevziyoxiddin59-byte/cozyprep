@@ -1,0 +1,6 @@
+{
+  "name": "CozyPrep",
+  "description": "Cozy exam preparation studio with AI test extraction, a linked Telegram Mini App, and native Telegram chat quizzes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
