@@ -210,7 +210,11 @@ export function TelegramHub({
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-[#FBF9F5] border border-[#E6E1D6] p-4">
                 <div className="space-y-0.5">
                   <p className="text-sm font-semibold text-[#1F2421]">
-                    {status.webhookRegistered ? 'Webhook & Mini App Active' : 'Webhook Not Registered Yet'}
+                    {status.webhookMatchesCurrentApp
+                      ? 'Webhook & Mini App Active'
+                      : status.webhookRegistered
+                        ? 'Webhook Points to Another URL'
+                        : 'Webhook Not Registered Yet'}
                   </p>
                   <p className="text-xs text-[#5F6660] break-all">
                     {status.webhookUrl || 'Click Connect Webhook to point Telegram updates to this app.'}
@@ -227,8 +231,10 @@ export function TelegramHub({
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       Connecting...
                     </>
-                  ) : status.webhookRegistered ? (
+                  ) : status.webhookMatchesCurrentApp ? (
                     'Re-sync Webhook'
+                  ) : status.webhookRegistered ? (
+                    'Switch Webhook to This App'
                   ) : (
                     'Connect Webhook & Mini App'
                   )}

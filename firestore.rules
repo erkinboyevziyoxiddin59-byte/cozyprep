@@ -1,0 +1,411 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidShareCode(code) {
+      return code is string && code.size() >= 4 && code.size() <= 64 && code.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidUserCollection(data, userId, collectionId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'title',
+          'language',
+          'totalQuestions',
+          'packageCount',
+          'shareCode',
+          'isSharedWithMe',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'title',
+          'sourceFilename',
+          'language',
+          'totalQuestions',
+          'packageCount',
+          'shareCode',
+          'isSharedWithMe',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.id == collectionId
+        && data.ownerUid == userId
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 240
+        && (!('sourceFilename' in data) || data.sourceFilename == null || (data.sourceFilename is string && data.sourceFilename.size() <= 240))
+        && data.language is string && data.language.size() >= 1 && data.language.size() <= 64
+        && data.totalQuestions is number && data.totalQuestions >= 0 && data.totalQuestions <= 20000
+        && data.packageCount is number && data.packageCount >= 1 && data.packageCount <= 400
+        && isValidShareCode(data.shareCode)
+        && data.isSharedWithMe is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserDeck(data, userId, deckId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'collectionId',
+          'partNumber',
+          'totalParts',
+          'rangeStart',
+          'rangeEnd',
+          'shareCode',
+          'title',
+          'description',
+          'language',
+          'isSharedWithMe',
+          'questions',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'collectionId',
+          'partNumber',
+          'totalParts',
+          'rangeStart',
+          'rangeEnd',
+          'shareCode',
+          'title',
+          'description',
+          'language',
+          'sourceFilename',
+          'isSharedWithMe',
+          'questions',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.id == deckId
+        && data.ownerUid == userId
+        && isValidId(data.collectionId)
+        && data.partNumber is number && data.partNumber >= 1 && data.partNumber <= 400
+        && data.totalParts is number && data.totalParts >= 1 && data.totalParts <= 400
+        && data.rangeStart is number && data.rangeStart >= 1
+        && data.rangeEnd is number && data.rangeEnd >= data.rangeStart
+        && isValidShareCode(data.shareCode)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 240
+        && data.description is string && data.description.size() <= 500
+        && data.language is string && data.language.size() >= 1 && data.language.size() <= 64
+        && (!('sourceFilename' in data) || data.sourceFilename == null || (data.sourceFilename is string && data.sourceFilename.size() <= 240))
+        && data.isSharedWithMe is bool
+        && data.questions is list && data.questions.size() >= 1 && data.questions.size() <= 50
+        && data.questions[0] is map
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserProgress(data, userId, deckId) {
+      return data.keys().hasAll([
+          'deckId',
+          'ownerUid',
+          'mode',
+          'currentIndex',
+          'selectedMap',
+          'elapsedSeconds',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'deckId',
+          'ownerUid',
+          'mode',
+          'currentIndex',
+          'selectedMap',
+          'elapsedSeconds',
+          'updatedAt'
+        ])
+        && data.deckId == deckId
+        && data.ownerUid == userId
+        && data.mode in ['quiz', 'exam']
+        && data.currentIndex is number && data.currentIndex >= 0 && data.currentIndex <= 50
+        && data.selectedMap is map && data.selectedMap.size() <= 60
+        && data.elapsedSeconds is number && data.elapsedSeconds >= 0 && data.elapsedSeconds <= 86400
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserAttempt(data, userId, attemptId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'deckId',
+          'deckTitle',
+          'deckLanguage',
+          'mode',
+          'source',
+          'score',
+          'total',
+          'durationSeconds',
+          'completedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'deckId',
+          'deckTitle',
+          'deckLanguage',
+          'mode',
+          'source',
+          'score',
+          'total',
+          'durationSeconds',
+          'completedAt'
+        ])
+        && data.id == attemptId
+        && data.ownerUid == userId
+        && isValidId(data.deckId)
+        && data.deckTitle is string && data.deckTitle.size() >= 1 && data.deckTitle.size() <= 240
+        && data.deckLanguage is string && data.deckLanguage.size() >= 1 && data.deckLanguage.size() <= 64
+        && data.mode in ['quiz', 'exam']
+        && data.source in ['web', 'miniapp', 'telegram_chat']
+        && data.score is number && data.score >= 0 && data.score <= 50
+        && data.total is number && data.total >= 1 && data.total <= 50
+        && data.durationSeconds is number && data.durationSeconds >= 0 && data.durationSeconds <= 86400
+        && data.completedAt is timestamp;
+    }
+
+    function isValidSharedBundle(data, shareCode) {
+      return data.keys().hasAll([
+          'shareCode',
+          'kind',
+          'ownerUid',
+          'title',
+          'language',
+          'totalQuestions',
+          'packageCount',
+          'collectionId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'shareCode',
+          'kind',
+          'ownerUid',
+          'title',
+          'sourceFilename',
+          'language',
+          'totalQuestions',
+          'packageCount',
+          'collectionId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.shareCode == shareCode
+        && data.kind in ['deck', 'collection']
+        && isValidId(data.ownerUid)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 240
+        && (!('sourceFilename' in data) || data.sourceFilename == null || (data.sourceFilename is string && data.sourceFilename.size() <= 240))
+        && data.language is string && data.language.size() >= 1 && data.language.size() <= 64
+        && data.totalQuestions is number && data.totalQuestions >= 1 && data.totalQuestions <= 20000
+        && data.packageCount is number && data.packageCount >= 1 && data.packageCount <= 400
+        && isValidId(data.collectionId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSharedPackage(data, parentShareCode, deckId) {
+      return data.keys().hasAll([
+          'id',
+          'parentShareCode',
+          'ownerUid',
+          'collectionId',
+          'partNumber',
+          'totalParts',
+          'rangeStart',
+          'rangeEnd',
+          'shareCode',
+          'title',
+          'description',
+          'language',
+          'questions',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'parentShareCode',
+          'ownerUid',
+          'collectionId',
+          'partNumber',
+          'totalParts',
+          'rangeStart',
+          'rangeEnd',
+          'shareCode',
+          'title',
+          'description',
+          'language',
+          'sourceFilename',
+          'questions',
+          'createdAt'
+        ])
+        && data.id == deckId
+        && data.parentShareCode == parentShareCode
+        && isValidId(data.ownerUid)
+        && isValidId(data.collectionId)
+        && data.partNumber is number && data.partNumber >= 1 && data.partNumber <= 400
+        && data.totalParts is number && data.totalParts >= 1 && data.totalParts <= 400
+        && data.rangeStart is number && data.rangeStart >= 1
+        && data.rangeEnd is number && data.rangeEnd >= data.rangeStart
+        && isValidShareCode(data.shareCode)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 240
+        && data.description is string && data.description.size() <= 500
+        && data.language is string && data.language.size() >= 1 && data.language.size() <= 64
+        && (!('sourceFilename' in data) || data.sourceFilename == null || (data.sourceFilename is string && data.sourceFilename.size() <= 240))
+        && data.questions is list && data.questions.size() >= 1 && data.questions.size() <= 50
+        && data.questions[0] is map
+        && data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      match /collections/{collectionId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(collectionId);
+        allow list: if isVerifiedOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(collectionId)
+          && isValidUserCollection(incoming(), userId, collectionId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(collectionId)
+          && isValidUserCollection(incoming(), userId, collectionId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().id == existing().id
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'totalQuestions', 'packageCount', 'updatedAt']);
+        allow delete: if isVerifiedOwner(userId) && isValidId(collectionId);
+      }
+
+      match /decks/{deckId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(deckId);
+        allow list: if isVerifiedOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(deckId)
+          && isValidUserDeck(incoming(), userId, deckId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            exists(/databases/$(database)/documents/users/$(userId)/collections/$(incoming().collectionId))
+            || existsAfter(/databases/$(database)/documents/users/$(userId)/collections/$(incoming().collectionId))
+          );
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(deckId)
+          && isValidUserDeck(incoming(), userId, deckId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().id == existing().id
+          && incoming().collectionId == existing().collectionId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'language', 'questions', 'updatedAt']);
+        allow delete: if isVerifiedOwner(userId) && isValidId(deckId);
+      }
+
+      match /progress/{deckId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(deckId);
+        allow list: if isVerifiedOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(deckId)
+          && isValidUserProgress(incoming(), userId, deckId)
+          && incoming().updatedAt == request.time;
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(deckId)
+          && isValidUserProgress(incoming(), userId, deckId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().deckId == existing().deckId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['mode', 'currentIndex', 'selectedMap', 'elapsedSeconds', 'updatedAt']);
+        allow delete: if isVerifiedOwner(userId) && isValidId(deckId);
+      }
+
+      match /attempts/{attemptId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(attemptId);
+        allow list: if isVerifiedOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(attemptId)
+          && isValidUserAttempt(incoming(), userId, attemptId)
+          && incoming().completedAt == request.time;
+        allow update: if false;
+        allow delete: if isVerifiedOwner(userId) && isValidId(attemptId);
+      }
+    }
+
+    match /shares/{shareCode} {
+      allow get: if isValidShareCode(shareCode);
+      allow list: if false;
+      allow create: if isVerifiedUser()
+        && isValidShareCode(shareCode)
+        && isValidSharedBundle(incoming(), shareCode)
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidShareCode(shareCode)
+        && existing().ownerUid == request.auth.uid
+        && isValidSharedBundle(incoming(), shareCode)
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'totalQuestions', 'packageCount', 'updatedAt']);
+      allow delete: if isVerifiedUser()
+        && isValidShareCode(shareCode)
+        && existing().ownerUid == request.auth.uid;
+
+      match /packages/{deckId} {
+        allow get: if isValidShareCode(shareCode) && isValidId(deckId);
+        allow list: if isValidShareCode(shareCode) && existing().parentShareCode == shareCode;
+        allow create: if isVerifiedUser()
+          && isValidShareCode(shareCode)
+          && isValidId(deckId)
+          && isValidSharedPackage(incoming(), shareCode, deckId)
+          && incoming().ownerUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && getAfter(/databases/$(database)/documents/shares/$(shareCode)).data.ownerUid == request.auth.uid;
+        allow update: if isVerifiedUser()
+          && isValidShareCode(shareCode)
+          && isValidId(deckId)
+          && existing().ownerUid == request.auth.uid
+          && isValidSharedPackage(incoming(), shareCode, deckId)
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().parentShareCode == existing().parentShareCode
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'questions'])
+          && get(/databases/$(database)/documents/shares/$(shareCode)).data.ownerUid == request.auth.uid;
+        allow delete: if isVerifiedUser()
+          && isValidShareCode(shareCode)
+          && isValidId(deckId)
+          && existing().ownerUid == request.auth.uid;
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import type { Request } from 'express';
-import type { TelegramStatus } from '../src/types.ts';
+import * as XLSX from 'xlsx';
+import type { DeckDetail, Question, TelegramStatus, TestCollection } from '../src/types.ts';
 import {
   completeLinkCode,
   getCollectionById,
@@ -56,17 +57,33 @@ export function verifyWebhookSecretHeader(headerValue: string | undefined): bool
   return crypto.timingSafeEqual(a, b);
 }
 
+let lastKnownBaseUrl: string | null = null;
+
 export function resolvePublicBaseUrl(req?: Request): string {
+  if (req) {
+    const rawHost =
+      (req.headers['x-forwarded-host'] as string)?.split(',')[0]?.trim() || req.get('host');
+    if (rawHost) {
+      const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(rawHost);
+      if (!isLocal) {
+        const rawProto =
+          (req.headers['x-forwarded-proto'] as string)?.split(',')[0]?.trim() ||
+          req.protocol ||
+          'https';
+        const resolved = `${rawProto === 'http' ? 'https' : rawProto}://${rawHost}`.replace(/\/+$/, '');
+        if (resolved.startsWith('https://')) {
+          lastKnownBaseUrl = resolved;
+        }
+        return resolved;
+      }
+    }
+  }
+  if (lastKnownBaseUrl) {
+    return lastKnownBaseUrl;
+  }
   const envUrl = process.env.APP_URL?.trim();
   if (envUrl && envUrl !== 'MY_APP_URL' && envUrl.startsWith('http')) {
     return envUrl.replace(/\/+$/, '');
-  }
-  if (req) {
-    const proto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0]?.trim() || req.protocol || 'https';
-    const host = (req.headers['x-forwarded-host'] as string)?.split(',')[0]?.trim() || req.get('host');
-    if (host) {
-      return `${proto}://${host}`.replace(/\/+$/, '');
-    }
   }
   return 'http://localhost:3000';
 }
@@ -74,21 +91,91 @@ export function resolvePublicBaseUrl(req?: Request): string {
 async function callTelegram<T = unknown>(
   method: string,
   payload?: Record<string, unknown>,
+  retries = 2,
 ): Promise<{ ok: boolean; result?: T; description?: string }> {
   const token = getBotToken();
   if (!token) {
     throw new Error('TELEGRAM_BOT_TOKEN is not set in server secrets.');
   }
-  const res = await fetch(`${TELEGRAM_API_BASE}/bot${token}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload ?? {}),
-  });
-  const json = (await res.json()) as { ok: boolean; result?: T; description?: string };
-  if (!json.ok) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(`${TELEGRAM_API_BASE}/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload ?? {}),
+    });
+    const json = (await res.json()) as {
+      ok: boolean;
+      result?: T;
+      description?: string;
+      error_code?: number;
+      parameters?: { retry_after?: number };
+    };
+    if (json.ok) {
+      return json;
+    }
+    if (json.error_code === 429 && attempt < retries) {
+      const waitSec = Math.min(10, Math.max(1, json.parameters?.retry_after ?? 2));
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      continue;
+    }
     throw new Error(json.description || `Telegram API ${method} failed`);
   }
-  return json;
+  throw new Error(`Telegram API ${method} failed`);
+}
+
+async function sendTelegramDocument(
+  chatId: string,
+  filename: string,
+  buffer: Buffer,
+  caption?: string,
+): Promise<void> {
+  const token = getBotToken();
+  if (!token) {
+    throw new Error('TELEGRAM_BOT_TOKEN is not set in server secrets.');
+  }
+  const form = new FormData();
+  form.append('chat_id', chatId);
+  if (caption) {
+    form.append('caption', caption.slice(0, 1024));
+  }
+  const blob = new Blob([new Uint8Array(buffer)], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  form.append('document', blob, filename);
+
+  const res = await fetch(`${TELEGRAM_API_BASE}/bot${token}/sendDocument`, {
+    method: 'POST',
+    body: form,
+  });
+  const json = (await res.json()) as { ok: boolean; description?: string };
+  if (!json.ok) {
+    throw new Error(json.description || 'Failed to send package file to Telegram');
+  }
+}
+
+function buildQuestionsWorkbookBuffer(
+  sheetTitle: string,
+  questions: Question[],
+): Buffer {
+  const rows: string[][] = [['#', 'Question', 'Correct Answer', 'Option 2', 'Option 3', 'Option 4', 'Option 5']];
+  questions.forEach((q, idx) => {
+    const correct = q.options[q.correctIndex] ?? q.options[0] ?? '';
+    const wrongs = q.options.filter((_, i) => i !== q.correctIndex);
+    rows.push([
+      String(idx + 1),
+      q.prompt,
+      correct,
+      wrongs[0] ?? '',
+      wrongs[1] ?? '',
+      wrongs[2] ?? '',
+      wrongs[3] ?? '',
+    ]);
+  });
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  const safeSheetName = sheetTitle.replace(/[\\/?*[\]:]/g, ' ').trim().slice(0, 31) || 'Questions';
+  XLSX.utils.book_append_sheet(wb, ws, safeSheetName);
+  return Buffer.from(XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }));
 }
 
 let cachedBotUsername: string | null = null;
@@ -104,9 +191,115 @@ async function getBotUsernameCached(): Promise<string | null> {
   }
 }
 
-export async function getTelegramStatus(req?: Request): Promise<TelegramStatus> {
+let cachedWebhookUrl: string | null = null;
+let cachedWebhookAt = 0;
+let autoSyncPromise: Promise<void> | null = null;
+let lastAutoSyncAt = 0;
+
+function isSafeRemoteHttpsHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (
+    host === 'localhost' ||
+    host === '::1' ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export async function mirrorShareBundleToRegisteredWebhook(
+  bundle: {
+    collection?: Partial<TestCollection> | null;
+    packages: DeckDetail[];
+    userKey?: string | null;
+    telegramChatId?: string | null;
+  },
+  currentBaseUrl: string,
+): Promise<boolean> {
+  if (!getBotToken() || bundle.packages.length === 0) return false;
+  try {
+    let hookUrl = cachedWebhookUrl;
+    if (!hookUrl || Date.now() - cachedWebhookAt > 60_000) {
+      const hookRes = await callTelegram<{ url?: string }>('getWebhookInfo');
+      hookUrl = hookRes.result?.url || null;
+      cachedWebhookUrl = hookUrl;
+      cachedWebhookAt = Date.now();
+    }
+    if (!hookUrl || !hookUrl.startsWith('https://')) return false;
+    const parsedHook = new URL(hookUrl);
+    if (!isSafeRemoteHttpsHost(parsedHook.hostname)) return false;
+    const hookOrigin = parsedHook.origin.replace(/\/+$/, '');
+    const localOrigin = currentBaseUrl.replace(/\/+$/, '');
+    if (hookOrigin === localOrigin) return true;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(`${hookOrigin}/api/share/publish`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...bundle, skipMirror: true }),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function ensureWebhookForPublicHost(req?: Request): Promise<void> {
+  if (!getBotToken()) return;
+  const baseUrl = resolvePublicBaseUrl(req);
+  if (!baseUrl.startsWith('https://')) return;
+  try {
+    const parsed = new URL(baseUrl);
+    if (!isSafeRemoteHttpsHost(parsed.hostname) || parsed.hostname.startsWith('ais-dev-')) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  if (Date.now() - lastAutoSyncAt < 60_000) return;
+  if (autoSyncPromise) {
+    await autoSyncPromise;
+    return;
+  }
+
+  autoSyncPromise = (async () => {
+    try {
+      lastAutoSyncAt = Date.now();
+      const expectedWebhookUrl = `${baseUrl}/api/telegram/webhook`;
+      const hookRes = await callTelegram<{ url?: string }>('getWebhookInfo');
+      const currentUrl = hookRes.result?.url || null;
+      cachedWebhookUrl = currentUrl;
+      cachedWebhookAt = Date.now();
+      if (currentUrl !== expectedWebhookUrl) {
+        await setupTelegramWebhook(req);
+      }
+    } catch {
+      // Ignore transient auto-sync error
+    } finally {
+      autoSyncPromise = null;
+    }
+  })();
+
+  await autoSyncPromise;
+}
+
+export async function getTelegramStatus(
+  req?: Request,
+  options?: { autoSync?: boolean },
+): Promise<TelegramStatus> {
+  if (options?.autoSync) {
+    await ensureWebhookForPublicHost(req);
+  }
   const baseUrl = resolvePublicBaseUrl(req);
   const miniAppUrl = `${baseUrl}/miniapp`;
+  const expectedWebhookUrl = `${baseUrl}/api/telegram/webhook`;
   const token = getBotToken();
 
   if (!token) {
@@ -116,6 +309,7 @@ export async function getTelegramStatus(req?: Request): Promise<TelegramStatus> 
       botFirstName: null,
       webhookUrl: null,
       webhookRegistered: false,
+      webhookMatchesCurrentApp: false,
       miniAppUrl,
       lastError: null,
     };
@@ -128,12 +322,15 @@ export async function getTelegramStatus(req?: Request): Promise<TelegramStatus> 
     ]);
     cachedBotUsername = meRes.result?.username ?? null;
     const currentUrl = hookRes.result?.url || null;
+    cachedWebhookUrl = currentUrl;
+    cachedWebhookAt = Date.now();
     return {
       configured: true,
       botUsername: meRes.result?.username ?? null,
       botFirstName: meRes.result?.first_name ?? null,
       webhookUrl: currentUrl,
       webhookRegistered: Boolean(currentUrl && currentUrl.includes('/api/telegram/webhook')),
+      webhookMatchesCurrentApp: Boolean(currentUrl && currentUrl === expectedWebhookUrl),
       miniAppUrl,
       lastError: null,
     };
@@ -144,6 +341,7 @@ export async function getTelegramStatus(req?: Request): Promise<TelegramStatus> 
       botFirstName: null,
       webhookUrl: null,
       webhookRegistered: false,
+      webhookMatchesCurrentApp: false,
       miniAppUrl,
       lastError: err instanceof Error ? err.message : 'Unable to reach Telegram Bot API',
     };
@@ -269,7 +467,18 @@ export async function sendQuizToChat(
     const q = slice[i];
     const questionNumber = offset + i + 1;
     const promptText = clampText(`Q${questionNumber}/${deck.questions.length}: ${q.prompt}`, 300);
-    const options = q.options.slice(0, 10).map((opt) => clampText(opt, 100));
+
+    // Ensure Telegram poll options are non-empty, <= 100 chars, and distinct
+    const seen = new Set<string>();
+    const options = q.options.slice(0, 10).map((opt, idx) => {
+      let val = clampText(opt || `Option ${idx + 1}`, 100) || `Option ${idx + 1}`;
+      if (seen.has(val.toLowerCase())) {
+        const suffix = ` (${idx + 1})`;
+        val = `${clampText(val, 100 - suffix.length)}${suffix}`;
+      }
+      seen.add(val.toLowerCase());
+      return val;
+    });
     const safeCorrect = Math.min(Math.max(0, q.correctIndex), options.length - 1);
     const explanation = q.explanation ? clampText(q.explanation, 200) : undefined;
 
@@ -284,7 +493,7 @@ export async function sendQuizToChat(
     });
 
     if (i < slice.length - 1) {
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 350));
     }
   }
 
@@ -315,6 +524,7 @@ export async function sendQuizToChat(
     const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(deepLink)}&text=${encodeURIComponent(`Try this quiz package: ${deck.title}`)}`;
     inlineButtons.push([{ text: 'Share Package with Someone', url: shareUrl }]);
   }
+  inlineButtons.push([{ text: 'Download Package (.xlsx)', callback_data: `dl_pkg:${deck.id}` }]);
 
   if (inlineButtons.length > 0) {
     await callTelegram('sendMessage', {
@@ -394,6 +604,127 @@ export interface TelegramUpdatePayload {
   };
 }
 
+async function sendSharedDeckCard(
+  chatId: string,
+  sharedDeck: DeckDetail,
+  baseUrl: string,
+  canUseWebApp: boolean,
+): Promise<void> {
+  saveSharedDeckForUser(chatId, sharedDeck.id);
+  const buttons: Array<Array<Record<string, unknown>>> = [
+    [{ text: 'Start Quiz Here in Chat (10 per batch)', callback_data: `quiz:${sharedDeck.id}` }],
+    [{ text: 'Download Package (.xlsx)', callback_data: `dl_pkg:${sharedDeck.id}` }],
+    [{ text: 'My Saved Tests', callback_data: 'list_decks' }],
+  ];
+  if (canUseWebApp) {
+    buttons.unshift([
+      {
+        text: 'Open & Solve in Mini App',
+        web_app: { url: `${baseUrl}/miniapp?share=${sharedDeck.shareCode}` },
+      },
+    ]);
+  }
+  await callTelegram('sendMessage', {
+    chat_id: chatId,
+    text:
+      `Shared Quiz Package: "${sharedDeck.title}"\n` +
+      `${sharedDeck.questions.length} multiple-choice questions · ${sharedDeck.language}\n\n` +
+      `Saved to your CozyPrep tests! Choose how to study or download this package:`,
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+async function sendSharedCollectionCard(
+  chatId: string,
+  sharedCol: TestCollection,
+  baseUrl: string,
+  canUseWebApp: boolean,
+): Promise<void> {
+  if (sharedCol.id && sharedCol.packages.some((p) => p.collectionId === sharedCol.id)) {
+    saveSharedCollectionForUser(chatId, sharedCol.id);
+  }
+  for (const pkg of sharedCol.packages) {
+    saveSharedDeckForUser(chatId, pkg.id);
+  }
+  const buttons: Array<Array<Record<string, unknown>>> = [
+    [{ text: `Choose Part (${sharedCol.packageCount} Packages)`, callback_data: `col_parts:${sharedCol.id}` }],
+    [{ text: 'Download Full Test (.xlsx)', callback_data: `dl_col:${sharedCol.id}` }],
+    [{ text: 'My Saved Tests', callback_data: 'list_decks' }],
+  ];
+  if (canUseWebApp) {
+    buttons.unshift([
+      {
+        text: `Open Test (${sharedCol.packageCount} Packages)`,
+        web_app: { url: `${baseUrl}/miniapp?shareCol=${sharedCol.shareCode}` },
+      },
+    ]);
+  }
+  await callTelegram('sendMessage', {
+    chat_id: chatId,
+    text:
+      `Shared Test Bank: "${sharedCol.title}"\n` +
+      `${sharedCol.totalQuestions} multiple-choice questions across ${sharedCol.packageCount} package(s) · ${sharedCol.language}\n\n` +
+      `Saved to your CozyPrep tests! Open in Mini App, pick a part in chat, or download the file:`,
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+async function tryDeliverSharedArg(
+  chatId: string,
+  arg: string,
+  baseUrl: string,
+  canUseWebApp: boolean,
+): Promise<'delivered' | 'not_found' | 'not_share'> {
+  const trimmed = arg.trim();
+  if (!trimmed) return 'not_share';
+  const lower = trimmed.toLowerCase();
+
+  if (lower.startsWith('pkg_')) {
+    const code = trimmed.slice(4).trim();
+    const deck = getDeckByShareCode(code);
+    if (deck) {
+      await sendSharedDeckCard(chatId, deck, baseUrl, canUseWebApp);
+      return 'delivered';
+    }
+    const colFallback = getCollectionByShareCode(code);
+    if (colFallback && colFallback.packages.length > 0) {
+      await sendSharedCollectionCard(chatId, colFallback, baseUrl, canUseWebApp);
+      return 'delivered';
+    }
+    return 'not_found';
+  }
+
+  if (lower.startsWith('col_')) {
+    const code = trimmed.slice(4).trim();
+    const col = getCollectionByShareCode(code);
+    if (col && col.packages.length > 0) {
+      await sendSharedCollectionCard(chatId, col, baseUrl, canUseWebApp);
+      return 'delivered';
+    }
+    const deckFallback = getDeckByShareCode(code);
+    if (deckFallback) {
+      await sendSharedDeckCard(chatId, deckFallback, baseUrl, canUseWebApp);
+      return 'delivered';
+    }
+    return 'not_found';
+  }
+
+  if (!lower.startsWith('link_') && /^[A-Za-z0-9_-]{6,64}$/.test(trimmed)) {
+    const deck = getDeckByShareCode(trimmed);
+    if (deck) {
+      await sendSharedDeckCard(chatId, deck, baseUrl, canUseWebApp);
+      return 'delivered';
+    }
+    const col = getCollectionByShareCode(trimmed);
+    if (col && col.packages.length > 0) {
+      await sendSharedCollectionCard(chatId, col, baseUrl, canUseWebApp);
+      return 'delivered';
+    }
+  }
+
+  return 'not_share';
+}
+
 export async function handleTelegramUpdate(update: TelegramUpdatePayload, baseUrl: string): Promise<void> {
   const canUseWebApp = baseUrl.startsWith('https://');
 
@@ -405,80 +736,28 @@ export async function handleTelegramUpdate(update: TelegramUpdatePayload, baseUr
 
     upsertTelegramSession(chatId, { username, firstName });
 
-    if (msg.text && msg.text.startsWith('/start')) {
-      const arg = msg.text.replace('/start', '').trim();
-
-      if (arg.startsWith('pkg_')) {
-        const shareCode = arg.replace('pkg_', '').trim().toUpperCase();
-        const sharedDeck = getDeckByShareCode(shareCode);
-        if (sharedDeck) {
-          saveSharedDeckForUser(chatId, sharedDeck.id);
-          const buttons: Array<Array<Record<string, unknown>>> = [
-            [{ text: 'Start Quiz Here in Chat (10 per batch)', callback_data: `quiz:${sharedDeck.id}` }],
-            [{ text: 'My Saved Tests', callback_data: 'list_decks' }],
-          ];
-          if (canUseWebApp) {
-            buttons.unshift([
-              {
-                text: 'Open & Solve in Mini App',
-                web_app: { url: `${baseUrl}/miniapp?share=${sharedDeck.shareCode}` },
-              },
-            ]);
-          }
-          await callTelegram('sendMessage', {
-            chat_id: chatId,
-            text:
-              `Shared Quiz Package: "${sharedDeck.title}"\n` +
-              `${sharedDeck.questions.length} multiple-choice questions · ${sharedDeck.language}\n\n` +
-              `Added to your CozyPrep library! Choose how you want to solve it:`,
-            reply_markup: { inline_keyboard: buttons },
-          });
-          return;
-        }
+    const startMatch = msg.text?.match(/^\/start(?:@\S+)?(?:\s+(.*))?$/i);
+    if (startMatch) {
+      const arg = (startMatch[1] || '').trim();
+      const shareResult = await tryDeliverSharedArg(chatId, arg, baseUrl, canUseWebApp);
+      if (shareResult === 'delivered') {
+        return;
+      }
+      if (shareResult === 'not_found') {
         await callTelegram('sendMessage', {
           chat_id: chatId,
-          text: 'That shared quiz package could not be found or was removed.',
+          text:
+            arg.toLowerCase().startsWith('pkg_')
+              ? 'That shared quiz package could not be found or was removed.'
+              : 'That shared test could not be found or was removed.',
         });
         return;
       }
 
-      if (arg.startsWith('col_')) {
-        const shareCode = arg.replace('col_', '').trim().toUpperCase();
-        const sharedCol = getCollectionByShareCode(shareCode);
-        if (sharedCol && sharedCol.packages.length > 0) {
-          saveSharedCollectionForUser(chatId, sharedCol.id);
-          const buttons: Array<Array<Record<string, unknown>>> = [
-            [{ text: `Choose Part (${sharedCol.packageCount} Packages)`, callback_data: `col_parts:${sharedCol.id}` }],
-            [{ text: 'My Saved Tests', callback_data: 'list_decks' }],
-          ];
-          if (canUseWebApp) {
-            buttons.unshift([
-              {
-                text: `Open Test (${sharedCol.packageCount} Packages)`,
-                web_app: { url: `${baseUrl}/miniapp?shareCol=${sharedCol.shareCode}` },
-              },
-            ]);
-          }
-          await callTelegram('sendMessage', {
-            chat_id: chatId,
-            text:
-              `Shared Test Bank: "${sharedCol.title}"\n` +
-              `${sharedCol.totalQuestions} multiple-choice questions across ${sharedCol.packageCount} package(s) · ${sharedCol.language}\n\n` +
-              `Added to your CozyPrep library! Open it in the Mini App or pick a package in chat:`,
-            reply_markup: { inline_keyboard: buttons },
-          });
-          return;
-        }
-        await callTelegram('sendMessage', {
-          chat_id: chatId,
-          text: 'That shared test could not be found or was removed.',
-        });
-        return;
-      }
-
+      const argLower = arg.toLowerCase();
       let linkMsg = '';
-      if (arg.startsWith('link_')) {
-        const code = arg.replace('link_', '').trim().toUpperCase();
+      if (argLower.startsWith('link_')) {
+        const code = arg.slice(5).trim().toUpperCase();
         const ok = completeLinkCode(code, { chatId, username, firstName });
         if (ok) {
           linkMsg = '\n\nYour Web Studio is now linked to this Telegram chat!';
@@ -556,9 +835,21 @@ export async function handleTelegramUpdate(update: TelegramUpdatePayload, baseUr
     }
 
     if (msg.text) {
+      const shareResult = await tryDeliverSharedArg(chatId, msg.text, baseUrl, canUseWebApp);
+      if (shareResult === 'delivered') {
+        return;
+      }
+      if (shareResult === 'not_found') {
+        await callTelegram('sendMessage', {
+          chat_id: chatId,
+          text: 'That shared code was not found on this server yet. Ask the sender to open Share in CozyPrep to sync it, or check the code.',
+        });
+        return;
+      }
+
       await callTelegram('sendMessage', {
         chat_id: chatId,
-        text: 'Send me a Word (.docx, .doc) or Excel (.xlsx, .xls) test file to turn it into 50-question multiple-choice packages, or use /quizzes to view saved packages.',
+        text: 'Send me a Word (.docx, .doc) or Excel (.xlsx, .xls) test file to turn it into 50-question multiple-choice packages, paste a share code (pkg_... / col_...), or use /quizzes to view saved packages.',
       });
     }
     return;
@@ -596,7 +887,7 @@ export async function handleTelegramUpdate(update: TelegramUpdatePayload, baseUr
           text:
             `Processing "${fileName}" in the background (${language === 'Original' ? 'exact original text' : `translating to ${language}`})...\n` +
             `You can close Telegram or the Mini App—I will reply here as soon as your 50-question packages are ready!`,
-        });
+        }).catch(() => {});
       }
 
       try {
@@ -722,6 +1013,16 @@ export async function handleTelegramUpdate(update: TelegramUpdatePayload, baseUr
           },
         ]);
       }
+      if (botUsername && col.shareCode) {
+        const colLink = `https://t.me/${botUsername}?start=col_${col.shareCode}`;
+        keyboard.push([
+          {
+            text: `Share Whole Test (${col.packageCount} Packages)`,
+            url: `https://t.me/share/url?url=${encodeURIComponent(colLink)}&text=${encodeURIComponent(`Practice "${col.title}" (${col.totalQuestions} questions)`)}`,
+          },
+        ]);
+      }
+      keyboard.push([{ text: 'Download Full Test (.xlsx)', callback_data: `dl_col:${col.id}` }]);
       col.packages.slice(0, 12).forEach((pkg) => {
         const row: Array<Record<string, unknown>> = [
           {
@@ -743,6 +1044,47 @@ export async function handleTelegramUpdate(update: TelegramUpdatePayload, baseUr
         text: `${col.title} (${col.totalQuestions} questions · ${col.packageCount} packages)\nPick a package to start or share:`,
         reply_markup: { inline_keyboard: keyboard },
       });
+      return;
+    }
+
+    if (data.startsWith('dl_pkg:')) {
+      const deckId = data.slice('dl_pkg:'.length);
+      const deck = getDeckById(deckId);
+      if (!deck) {
+        await callTelegram('sendMessage', { chat_id: chatId, text: 'That package could not be found.' });
+        return;
+      }
+      const safeName = `${deck.title.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60) || 'package'}.xlsx`;
+      const buf = buildQuestionsWorkbookBuffer(deck.title, deck.questions);
+      await sendTelegramDocument(
+        chatId,
+        safeName,
+        buf,
+        `${deck.title} (${deck.questions.length} questions · saved in your CozyPrep library)`,
+      );
+      return;
+    }
+
+    if (data.startsWith('dl_col:')) {
+      const colId = data.slice('dl_col:'.length);
+      const col = getCollectionById(colId);
+      if (!col || col.packages.length === 0) {
+        await callTelegram('sendMessage', { chat_id: chatId, text: 'That test file could not be found.' });
+        return;
+      }
+      const allQ: Question[] = [];
+      for (const p of col.packages) {
+        const detail = getDeckById(p.id);
+        if (detail) allQ.push(...detail.questions);
+      }
+      const safeName = `${col.title.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60) || 'test'}.xlsx`;
+      const buf = buildQuestionsWorkbookBuffer(col.title, allQ);
+      await sendTelegramDocument(
+        chatId,
+        safeName,
+        buf,
+        `${col.title} (${allQ.length} questions across ${col.packageCount} packages · saved in your CozyPrep library)`,
+      );
       return;
     }
 
@@ -771,6 +1113,7 @@ async function sendDeckListToChat(chatId: string, baseUrl: string) {
   }
 
   const canUseWebApp = baseUrl.startsWith('https://');
+  const botUsername = await getBotUsernameCached();
   const keyboard: Array<Array<Record<string, unknown>>> = collections.map((col) => {
     if (col.packageCount > 1) {
       return [
@@ -780,12 +1123,21 @@ async function sendDeckListToChat(chatId: string, baseUrl: string) {
         },
       ];
     }
-    return [
+    const pkg = col.packages[0];
+    const row: Array<Record<string, unknown>> = [
       {
-        text: `Quiz: ${clampText(col.title, 30)} (${col.totalQuestions}q)`,
-        callback_data: `quiz:${col.packages[0].id}`,
+        text: `Quiz: ${clampText(col.title, 26)} (${col.totalQuestions}q)`,
+        callback_data: `quiz:${pkg.id}`,
       },
     ];
+    if (botUsername && pkg.shareCode) {
+      const link = `https://t.me/${botUsername}?start=pkg_${pkg.shareCode}`;
+      row.push({
+        text: 'Share',
+        url: `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(`Practice "${pkg.title}" (${col.totalQuestions} questions)`)}`,
+      });
+    }
+    return row;
   });
 
   if (canUseWebApp) {
@@ -794,7 +1146,7 @@ async function sendDeckListToChat(chatId: string, baseUrl: string) {
 
   await callTelegram('sendMessage', {
     chat_id: chatId,
-    text: 'Choose a test file to view its 50-question packages or open the Mini App:',
+    text: 'Choose a test file to start, share, or open in the Mini App:',
     reply_markup: { inline_keyboard: keyboard },
   });
 }

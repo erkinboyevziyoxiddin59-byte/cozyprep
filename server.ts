@@ -4,8 +4,9 @@ import fs from 'fs';
 import multer from 'multer';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import type { AttemptAnswer, PracticeSource, StudyMode } from './src/types.ts';
+import type { AttemptAnswer, DeckDetail, PracticeSource, StudyMode, TestCollection } from './src/types.ts';
 import {
+  bindUserKeyToTelegramId,
   clearQuizProgress,
   createLinkCode,
   deleteCollection,
@@ -29,11 +30,14 @@ import {
   saveSharedCollectionForUser,
   saveSharedDeckForUser,
   updateDeck,
+  upsertShareBundleToDb,
 } from './server/db.ts';
 import { isSupportedWordOrExcel, startExtractionJob } from './server/extractor.ts';
 import {
+  getBotToken,
   getTelegramStatus,
   handleTelegramUpdate,
+  mirrorShareBundleToRegisteredWebhook,
   resolvePublicBaseUrl,
   sendQuizToChat,
   setupTelegramWebhook,
@@ -75,7 +79,7 @@ const upload = multer({
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '15mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
@@ -163,6 +167,92 @@ async function startServer() {
     res.json({ deck });
   });
 
+  app.post('/api/share/implement', (req, res) => {
+    const body = req.body as { input?: string; userKey?: string; chatId?: string };
+    const raw = (body.input || '').trim();
+    if (!raw) {
+      res.status(400).json({ error: 'Please paste a share link or share code.' });
+      return;
+    }
+    const keys = [body.userKey, body.chatId].map((k) => (k || '').trim()).filter(Boolean);
+
+    const isCollectionHint = /(?:col_|shareCol=)/i.test(raw);
+    const isDeckHint = /(?:pkg_|share=)/i.test(raw) && !isCollectionHint;
+
+    if (isCollectionHint) {
+      const col = getCollectionByShareCode(raw);
+      if (col) {
+        for (const k of keys) {
+          saveSharedCollectionForUser(k, col.id);
+        }
+        res.json({ kind: 'collection', collection: getCollectionById(col.id) ?? col });
+        return;
+      }
+    }
+
+    if (!isCollectionHint) {
+      const deck = getDeckByShareCode(raw);
+      if (deck) {
+        for (const k of keys) {
+          saveSharedDeckForUser(k, deck.id);
+        }
+        res.json({ kind: 'deck', deck });
+        return;
+      }
+    }
+
+    if (!isDeckHint) {
+      const col = getCollectionByShareCode(raw);
+      if (col) {
+        for (const k of keys) {
+          saveSharedCollectionForUser(k, col.id);
+        }
+        res.json({ kind: 'collection', collection: getCollectionById(col.id) ?? col });
+        return;
+      }
+    }
+
+    res.status(404).json({ error: 'Shared package or test code could not be found.' });
+  });
+
+  app.post('/api/share/publish', async (req, res) => {
+    const body = req.body as {
+      collection?: Partial<TestCollection> | null;
+      packages?: DeckDetail[];
+      userKey?: string;
+      chatId?: string;
+      skipMirror?: boolean;
+    };
+    const packages = Array.isArray(body.packages) ? body.packages : [];
+    if (packages.length === 0) {
+      res.status(400).json({ error: 'No packages provided to publish.' });
+      return;
+    }
+
+    const result = upsertShareBundleToDb({
+      collection: body.collection ?? null,
+      packages,
+      userKey: body.userKey ?? null,
+      telegramChatId: body.chatId ?? null,
+    });
+
+    let mirrored = false;
+    if (!body.skipMirror && result.packages.length > 0) {
+      const baseUrl = resolvePublicBaseUrl(req);
+      mirrored = await mirrorShareBundleToRegisteredWebhook(
+        {
+          collection: result.collection ?? body.collection ?? null,
+          packages: result.packages,
+          userKey: body.userKey ?? null,
+          telegramChatId: body.chatId ?? null,
+        },
+        baseUrl,
+      ).catch(() => false);
+    }
+
+    res.json({ ok: true, mirrored, ...result });
+  });
+
   app.delete('/api/decks/:id/saved', (req, res) => {
     const userKey = typeof req.query.userKey === 'string' ? req.query.userKey.trim() : '';
     const chatId = typeof req.query.chatId === 'string' ? req.query.chatId.trim() : '';
@@ -186,6 +276,12 @@ async function startServer() {
       res.status(404).json({ error: 'Exam package not found.' });
       return;
     }
+    const baseUrl = resolvePublicBaseUrl(req);
+    const parentCol = shuffled.collectionId ? getCollectionById(shuffled.collectionId) : null;
+    void mirrorShareBundleToRegisteredWebhook(
+      { collection: parentCol, packages: [shuffled] },
+      baseUrl,
+    ).catch(() => {});
     res.json({ deck: shuffled });
   });
 
@@ -208,6 +304,12 @@ async function startServer() {
       res.status(404).json({ error: 'Exam package not found.' });
       return;
     }
+    const baseUrl = resolvePublicBaseUrl(req);
+    const parentCol = updated.collectionId ? getCollectionById(updated.collectionId) : null;
+    void mirrorShareBundleToRegisteredWebhook(
+      { collection: parentCol, packages: [updated] },
+      baseUrl,
+    ).catch(() => {});
     res.json({ deck: updated });
   });
 
@@ -223,20 +325,22 @@ async function startServer() {
   // --- Quiz Progress Auto-Save & Resume ---
   app.get('/api/progress', (req, res) => {
     const userKey = typeof req.query.userKey === 'string' ? req.query.userKey.trim() : '';
-    if (!userKey) {
+    const chatId = typeof req.query.chatId === 'string' ? req.query.chatId.trim() : '';
+    if (!userKey && !chatId) {
       res.json({ progress: {} });
       return;
     }
-    res.json({ progress: listProgressForUser(userKey) });
+    res.json({ progress: listProgressForUser(userKey || chatId, chatId || undefined) });
   });
 
   app.get('/api/decks/:id/progress', (req, res) => {
     const userKey = typeof req.query.userKey === 'string' ? req.query.userKey.trim() : '';
-    if (!userKey) {
+    const chatId = typeof req.query.chatId === 'string' ? req.query.chatId.trim() : '';
+    if (!userKey && !chatId) {
       res.json({ progress: null });
       return;
     }
-    const progress = getQuizProgress(req.params.id, userKey);
+    const progress = getQuizProgress(req.params.id, userKey || chatId, chatId || undefined);
     res.json({ progress });
   });
 
@@ -248,12 +352,13 @@ async function startServer() {
     }
     const body = req.body as {
       userKey?: string;
+      chatId?: string;
       mode?: StudyMode;
       currentIndex?: number;
       selectedMap?: Record<string, number>;
       elapsedSeconds?: number;
     };
-    const userKey = (body.userKey || '').trim();
+    const userKey = (body.chatId || body.userKey || '').trim();
     if (!userKey) {
       res.status(400).json({ error: 'Missing userKey.' });
       return;
@@ -271,8 +376,9 @@ async function startServer() {
 
   app.delete('/api/decks/:id/progress', (req, res) => {
     const userKey = typeof req.query.userKey === 'string' ? req.query.userKey.trim() : '';
-    if (userKey) {
-      clearQuizProgress(req.params.id, userKey);
+    const chatId = typeof req.query.chatId === 'string' ? req.query.chatId.trim() : '';
+    if (userKey || chatId) {
+      clearQuizProgress(req.params.id, userKey || chatId, chatId || undefined);
     }
     res.json({ ok: true });
   });
@@ -286,6 +392,7 @@ async function startServer() {
 
     const body = req.body as {
       userKey?: string;
+      telegramChatId?: string;
       mode?: StudyMode;
       source?: PracticeSource;
       score?: number;
@@ -304,6 +411,8 @@ async function startServer() {
 
     const attempt = recordAttempt({
       deckId: deck.id,
+      userKey: body.userKey?.trim() || null,
+      telegramChatId: body.telegramChatId?.trim() || null,
       mode,
       source,
       score,
@@ -312,15 +421,17 @@ async function startServer() {
       answers,
     });
 
-    if (body.userKey) {
-      clearQuizProgress(deck.id, body.userKey);
+    if (body.userKey || body.telegramChatId) {
+      clearQuizProgress(deck.id, body.userKey || body.telegramChatId || '', body.telegramChatId);
     }
 
     res.status(201).json({ attempt });
   });
 
-  app.get('/api/attempts/recent', (_req, res) => {
-    const attempts = getRecentAttempts(25);
+  app.get('/api/attempts/recent', (req, res) => {
+    const chatId = typeof req.query.chatId === 'string' ? req.query.chatId : undefined;
+    const userKey = typeof req.query.userKey === 'string' ? req.query.userKey : undefined;
+    const attempts = getRecentAttempts(30, { chatId, userKey });
     res.json({ attempts });
   });
 
@@ -355,13 +466,6 @@ async function startServer() {
         return;
       }
 
-      if (!process.env.GEMINI_API_KEY?.trim() || process.env.GEMINI_API_KEY === 'MY_GEMINI_API_KEY') {
-        res.status(400).json({
-          error: 'GEMINI_API_KEY is not configured. Please add your Gemini API key in Settings > Secrets.',
-        });
-        return;
-      }
-
       const job = startExtractionJob({
         buffer: req.file?.buffer,
         filename: req.file?.originalname || 'Pasted Test Notes',
@@ -382,7 +486,8 @@ async function startServer() {
 
   // --- Telegram Routes ---
   app.get('/api/telegram/status', async (req, res) => {
-    const status = await getTelegramStatus(req);
+    const autoSync = req.query.autoSync === '1';
+    const status = await getTelegramStatus(req, { autoSync });
     res.json(status);
   });
 
@@ -436,14 +541,29 @@ async function startServer() {
     }
   });
 
+  app.post('/api/telegram/bind-id', (req, res) => {
+    const { userKey, chatId } = req.body as { userKey?: string; chatId?: string };
+    const cleanChat = String(chatId || '').trim();
+    const cleanKey = String(userKey || '').trim();
+    if (!/^-?\d{4,20}$/.test(cleanChat)) {
+      res.status(400).json({ error: 'Please enter a valid numeric Telegram ID.' });
+      return;
+    }
+    if (cleanKey) {
+      bindUserKeyToTelegramId(cleanKey, cleanChat);
+    }
+    res.json({ ok: true, chatId: cleanChat });
+  });
+
   app.post('/api/telegram/verify-miniapp', (req, res) => {
     const { initData } = req.body as { initData?: string };
+    const botConfigured = Boolean(getBotToken());
     if (!initData) {
-      res.status(400).json({ valid: false, error: 'Missing initData.' });
+      res.status(400).json({ valid: false, botConfigured, error: 'Missing initData.' });
       return;
     }
     const result = verifyTelegramInitData(initData);
-    res.json(result);
+    res.json({ ...result, botConfigured });
   });
 
   app.post('/api/telegram/webhook', async (req, res) => {

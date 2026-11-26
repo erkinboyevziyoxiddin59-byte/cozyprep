@@ -6,11 +6,13 @@ import {
   CheckCircle2,
   ExternalLink,
   FolderOpen,
+  Link2,
   Loader2,
   Plus,
   Send,
   Share2,
   Trophy,
+  UserCheck,
   X,
 } from 'lucide-react';
 import type {
@@ -22,16 +24,17 @@ import type {
   TestCollection,
 } from '../types.ts';
 import {
-  buildCollectionShareUrl,
-  buildPackageShareUrl,
+  bindTelegramId,
+  extractShareTargetFromParams,
   fetchAllProgress,
   fetchCollectionDetail,
   fetchCollections,
   fetchDeckDetail,
   fetchJobs,
   fetchRecentAttempts,
-  fetchTelegramStatus,
+  getRawBrowserKey,
   getUserKey,
+  implementShareInput,
   implementSharedCollection,
   implementSharedDeck,
   sendQuizToTelegram,
@@ -39,6 +42,7 @@ import {
   verifyMiniAppInitData,
 } from '../lib/api.ts';
 import { PracticeRunner } from './PracticeRunner.tsx';
+import { ShareModal, type ShareTarget } from './ShareModal.tsx';
 
 declare global {
   interface Window {
@@ -49,6 +53,7 @@ declare global {
         openTelegramLink?: (url: string) => void;
         initData?: string;
         initDataUnsafe?: {
+          start_param?: string;
           user?: {
             id?: number;
             first_name?: string;
@@ -81,8 +86,11 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
   const [chatId, setChatId] = useState<string>(
     () => localStorage.getItem('cozyprep_chat_id') || '',
   );
+  const [tgIdInput, setTgIdInput] = useState<string>(
+    () => localStorage.getItem('cozyprep_chat_id') || '',
+  );
+  const [editingTgId, setEditingTgId] = useState(false);
   const [firstName, setFirstName] = useState<string | null>(null);
-  const [botUsername, setBotUsername] = useState<string | null>(null);
   const [isInsideTelegram, setIsInsideTelegram] = useState(false);
   const [toast, setToast] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [sendingDeckId, setSendingDeckId] = useState<string | null>(null);
@@ -94,6 +102,12 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
   const [uploadLang, setUploadLang] = useState('Original');
   const [startingJob, setStartingJob] = useState(false);
 
+  // Share modal & Open Shared Link sheet
+  const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null);
+  const [showImportSheet, setShowImportSheet] = useState(false);
+  const [importInput, setImportInput] = useState('');
+  const [importingShare, setImportingShare] = useState(false);
+
   const prevActiveJobIdsRef = useRef<Set<string>>(new Set());
   const effectiveUserKey = chatId.trim() || getUserKey();
 
@@ -102,57 +116,56 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
 
   async function refreshAll(verifiedChatId?: string, handleDeepLinks = false) {
     const cleanChat = verifiedChatId?.trim() || chatId.trim() || undefined;
-    const key = cleanChat || getUserKey();
+    const rawKey = getRawBrowserKey();
+    const progressKey = cleanChat || rawKey;
     setLoading(true);
     try {
       if (handleDeepLinks) {
         const params = new URLSearchParams(window.location.search);
-        const shareCode = params.get('share');
-        const shareColCode = params.get('shareCol');
-        const urlCollectionId = params.get('collectionId');
-        const urlDeckId = params.get('deckId');
+        const startParam = window.Telegram?.WebApp?.initDataUnsafe?.start_param ?? null;
+        const target = extractShareTargetFromParams(params, startParam);
 
-        if (shareCode) {
+        if (target.shareDeckCode) {
           try {
-            const detail = await implementSharedDeck(shareCode, {
-              userKey: key,
+            const detail = await implementSharedDeck(target.shareDeckCode, {
+              userKey: rawKey,
               chatId: cleanChat,
             });
             setActiveDeck(detail);
             setTab('quiz');
             setToast({
               type: 'ok',
-              text: `Added "${detail.title}" to your tests. Solve anytime — progress saves automatically.`,
+              text: `Saved "${detail.title}" to your Mini App tests. Solve anytime — progress saves automatically.`,
             });
           } catch {
             // ignore invalid share code
           }
-        } else if (shareColCode) {
+        } else if (target.shareCollectionCode) {
           try {
-            const col = await implementSharedCollection(shareColCode, {
-              userKey: key,
+            const col = await implementSharedCollection(target.shareCollectionCode, {
+              userKey: rawKey,
               chatId: cleanChat,
             });
             setSelectedCollectionId(col.id);
             setTab('decks');
             setToast({
               type: 'ok',
-              text: `Added "${col.title}" (${col.packageCount} packages) to your tests.`,
+              text: `Saved "${col.title}" (${col.packageCount} packages) to your Mini App tests.`,
             });
           } catch {
             // ignore invalid shareCol code
           }
-        } else if (urlCollectionId) {
+        } else if (target.collectionId) {
           try {
-            const col = await fetchCollectionDetail(urlCollectionId);
+            const col = await fetchCollectionDetail(target.collectionId);
             setSelectedCollectionId(col.id);
             setTab('decks');
           } catch {
             // ignore
           }
-        } else if (urlDeckId) {
+        } else if (target.deckId) {
           try {
-            const detail = await fetchDeckDetail(urlDeckId);
+            const detail = await fetchDeckDetail(target.deckId);
             setActiveDeck(detail);
             setTab('quiz');
           } catch {
@@ -161,20 +174,16 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
         }
       }
 
-      const [colList, recent, jobList, progress, tgStatus] = await Promise.all([
-        fetchCollections({ chatId: cleanChat, userKey: key }),
-        fetchRecentAttempts(),
-        fetchJobs({ userKey: key, chatId: cleanChat }),
-        fetchAllProgress(key),
-        fetchTelegramStatus().catch(() => null),
+      const [colList, recent, jobList, progress] = await Promise.all([
+        fetchCollections({ chatId: cleanChat, userKey: rawKey }),
+        fetchRecentAttempts({ chatId: cleanChat, userKey: rawKey }),
+        fetchJobs({ userKey: progressKey, chatId: cleanChat }),
+        fetchAllProgress(rawKey, cleanChat),
       ]);
       setCollections(colList);
       setAttempts(recent);
       setJobs(jobList);
       setProgressMap(progress);
-      if (tgStatus?.botUsername) {
-        setBotUsername(tgStatus.botUsername);
-      }
     } catch {
       // ignore initial error
     } finally {
@@ -183,21 +192,45 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
   }
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const paramTgId = params.get('tgId')?.trim();
     const tg = window.Telegram?.WebApp;
-    if (tg && tg.initData) {
+
+    if (tg && (tg.initData || tg.initDataUnsafe?.user?.id)) {
       setIsInsideTelegram(true);
       tg.ready();
       tg.expand();
-      void verifyMiniAppInitData(tg.initData).then((res) => {
-        if (res.valid && res.chatId) {
-          setChatId(res.chatId);
-          localStorage.setItem('cozyprep_chat_id', res.chatId);
-          setFirstName(res.firstName ?? null);
-          void refreshAll(res.chatId, true);
-        } else {
-          void refreshAll(undefined, true);
-        }
-      });
+
+      if (tg.initData) {
+        void verifyMiniAppInitData(tg.initData).then(async (res) => {
+          if (res.valid && res.chatId) {
+            setChatId(res.chatId);
+            setTgIdInput(res.chatId);
+            setFirstName(res.firstName ?? null);
+            await bindTelegramId(res.chatId);
+            void refreshAll(res.chatId, true);
+          } else if (!res.botConfigured && tg.initDataUnsafe?.user?.id) {
+            const unsafeId = String(tg.initDataUnsafe.user.id);
+            setChatId(unsafeId);
+            setTgIdInput(unsafeId);
+            setFirstName(tg.initDataUnsafe.user.first_name ?? null);
+            await bindTelegramId(unsafeId);
+            void refreshAll(unsafeId, true);
+          } else {
+            void refreshAll(undefined, true);
+          }
+        });
+      } else if (tg.initDataUnsafe?.user?.id) {
+        const unsafeId = String(tg.initDataUnsafe.user.id);
+        setChatId(unsafeId);
+        setTgIdInput(unsafeId);
+        setFirstName(tg.initDataUnsafe.user.first_name ?? null);
+        void bindTelegramId(unsafeId).then(() => refreshAll(unsafeId, true));
+      }
+    } else if (paramTgId && /^-?\d{4,20}$/.test(paramTgId)) {
+      setChatId(paramTgId);
+      setTgIdInput(paramTgId);
+      void bindTelegramId(paramTgId).then(() => refreshAll(paramTgId, true));
     } else {
       if (tg) {
         tg.ready();
@@ -229,9 +262,9 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
             const [colList, progress] = await Promise.all([
               fetchCollections({
                 chatId: chatId.trim() || undefined,
-                userKey: effectiveUserKey,
+                userKey: getRawBrowserKey(),
               }),
-              fetchAllProgress(effectiveUserKey),
+              fetchAllProgress(getRawBrowserKey(), chatId.trim() || undefined),
             ]);
             setCollections(colList);
             setProgressMap(progress);
@@ -246,7 +279,7 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
           }
         })
         .catch(() => {});
-    }, 2000);
+    }, 1000);
 
     return () => window.clearInterval(timer);
   }, [jobs, effectiveUserKey, chatId]);
@@ -295,53 +328,50 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
     }
   }
 
-  async function handleSharePackage(deck: ExamDeck) {
-    const shareUrl = buildPackageShareUrl(deck, botUsername);
-    const tg = window.Telegram?.WebApp;
-
-    if (tg?.openTelegramLink && botUsername) {
-      const text = encodeURIComponent(
-        `Practice "${deck.title}" (${deck.questionCount ?? 0} questions) on CozyPrep:`,
-      );
-      tg.openTelegramLink(
-        `https://t.me/share/url?url=${encodeURIComponent(shareUrl)}&text=${text}`,
-      );
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(shareUrl);
-      setToast({
-        type: 'ok',
-        text: `Package link copied! Anyone who opens it can save and solve "${deck.title}".`,
-      });
-    } catch {
-      setToast({ type: 'ok', text: `Share link: ${shareUrl}` });
-    }
+  function handleSharePackage(deck: ExamDeck) {
+    setShareTarget({ kind: 'deck', item: deck });
   }
 
-  async function handleShareCollection(col: TestCollection) {
-    const shareUrl = buildCollectionShareUrl(col, botUsername);
-    const tg = window.Telegram?.WebApp;
+  function handleShareCollection(col: TestCollection) {
+    setShareTarget({ kind: 'collection', item: col });
+  }
 
-    if (tg?.openTelegramLink && botUsername) {
-      const text = encodeURIComponent(
-        `Practice "${col.title}" (${col.totalQuestions} questions in ${col.packageCount} packages) on CozyPrep:`,
-      );
-      tg.openTelegramLink(
-        `https://t.me/share/url?url=${encodeURIComponent(shareUrl)}&text=${text}`,
-      );
-      return;
-    }
-
+  async function handleImportShared(e: React.FormEvent) {
+    e.preventDefault();
+    if (!importInput.trim()) return;
+    setImportingShare(true);
+    setToast(null);
     try {
-      await navigator.clipboard.writeText(shareUrl);
-      setToast({
-        type: 'ok',
-        text: `Test link copied! Anyone who opens it gets all ${col.packageCount} package(s) added to their library.`,
+      const cleanChat = chatId.trim() || undefined;
+      const result = await implementShareInput(importInput.trim(), {
+        userKey: getRawBrowserKey(),
+        chatId: cleanChat,
       });
-    } catch {
-      setToast({ type: 'ok', text: `Share link: ${shareUrl}` });
+      setShowImportSheet(false);
+      setImportInput('');
+      await refreshAll(cleanChat, false);
+      if (result.kind === 'deck') {
+        setActiveDeck(result.deck);
+        setTab('quiz');
+        setToast({
+          type: 'ok',
+          text: `Saved "${result.deck.title}" to your Mini App tests!`,
+        });
+      } else {
+        setSelectedCollectionId(result.collection.id);
+        setTab('decks');
+        setToast({
+          type: 'ok',
+          text: `Saved "${result.collection.title}" (${result.collection.packageCount} packages) to your Mini App tests!`,
+        });
+      }
+    } catch (err) {
+      setToast({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Could not find that shared package or code.',
+      });
+    } finally {
+      setImportingShare(false);
     }
   }
 
@@ -444,36 +474,103 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
           <div className="space-y-4">
             {!selectedCollection ? (
               <>
-                <div className="flex items-baseline justify-between">
-                  <h1 className="font-display text-2xl font-semibold text-[#1F2421]">
-                    My Tests
-                  </h1>
-                  <span className="text-xs text-[#5F6660] tabular-nums">
-                    {collections.length} {collections.length === 1 ? 'test' : 'tests'}
-                  </span>
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h1 className="font-display text-2xl font-semibold text-[#1F2421]">
+                      My Tests
+                    </h1>
+                    <p className="text-xs text-[#5F6660] tabular-nums">
+                      {collections.length} {collections.length === 1 ? 'test' : 'tests'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowImportSheet(true)}
+                    className="inline-flex items-center gap-1.5 min-h-[38px] px-3 rounded-xl border border-[#E6E1D6] bg-white text-xs font-semibold text-[#2F6F5E] hover:bg-[#ECF4F1] cursor-pointer"
+                  >
+                    <Link2 className="w-3.5 h-3.5" />
+                    Open Shared Link
+                  </button>
                 </div>
 
-                {!isInsideTelegram && (
-                  <div className="bg-white border border-[#E6E1D6] rounded-2xl p-4 space-y-2">
-                    <label
-                      htmlFor="miniapp-chatid"
-                      className="block text-xs font-medium text-[#5F6660]"
-                    >
-                      Linked Telegram Chat ID (auto-filled when opened inside Telegram)
-                    </label>
-                    <input
-                      id="miniapp-chatid"
-                      type="text"
-                      value={chatId}
-                      onChange={(e) => {
-                        setChatId(e.target.value);
-                        localStorage.setItem('cozyprep_chat_id', e.target.value);
+                <div className="bg-white border border-[#E6E1D6] rounded-2xl px-4 py-3 space-y-2">
+                  {chatId && !editingTgId ? (
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 min-w-0 text-xs text-[#1F2421]">
+                        <UserCheck className="w-4 h-4 text-[#2F6F5E] shrink-0" />
+                        <span className="truncate font-medium">
+                          Telegram ID <span className="font-mono">{chatId}</span> · Saved on Web
+                        </span>
+                      </div>
+                      {!isInsideTelegram && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTgIdInput(chatId);
+                            setEditingTgId(true);
+                          }}
+                          className="text-xs font-semibold text-[#2F6F5E] hover:underline shrink-0 cursor-pointer"
+                        >
+                          Change
+                        </button>
+                      )}
+                    </div>
+                  ) : !isInsideTelegram ? (
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const clean = tgIdInput.trim();
+                        if (clean && !/^-?\d{4,20}$/.test(clean)) {
+                          setToast({
+                            type: 'err',
+                            text: 'Please enter a numeric Telegram ID (e.g. 123456789).',
+                          });
+                          return;
+                        }
+                        if (!clean) {
+                          localStorage.removeItem('cozyprep_chat_id');
+                          setChatId('');
+                          setEditingTgId(false);
+                          void refreshAll(undefined, false);
+                          return;
+                        }
+                        setChatId(clean);
+                        setEditingTgId(false);
+                        void bindTelegramId(clean).then(() => refreshAll(clean, false));
                       }}
-                      placeholder="Enter Chat ID to send quizzes to bot"
-                      className="w-full rounded-xl border border-[#E6E1D6] bg-[#FBF9F5] px-3 py-2 font-mono text-xs text-[#1F2421] focus:outline-none focus:border-[#2F6F5E]"
-                    />
-                  </div>
-                )}
+                      className="flex items-center gap-2"
+                    >
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={tgIdInput}
+                        onChange={(e) => setTgIdInput(e.target.value)}
+                        placeholder="Telegram ID (e.g. 123456789)"
+                        className="flex-1 min-w-0 rounded-xl border border-[#E6E1D6] bg-[#FBF9F5] px-3 py-1.5 font-mono text-xs text-[#1F2421] focus:outline-none focus:border-[#2F6F5E]"
+                      />
+                      <button
+                        type="submit"
+                        className="px-3 py-1.5 rounded-xl bg-[#ECF4F1] border border-[#2F6F5E]/30 text-[#2F6F5E] text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        Sync ID
+                      </button>
+                      {editingTgId && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingTgId(false)}
+                          className="p-1.5 rounded-lg text-[#5F6660] hover:bg-[#EFECE4] cursor-pointer"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </form>
+                  ) : (
+                    <div className="flex items-center gap-2 text-xs text-[#5F6660]">
+                      <UserCheck className="w-4 h-4 text-[#2F6F5E] shrink-0" />
+                      <span>All tests and answers save automatically for your Telegram session.</span>
+                    </div>
+                  )}
+                </div>
 
                 {/* Background Extraction Jobs */}
                 {visibleJobs.length > 0 && (
@@ -543,13 +640,22 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
                     <p className="text-sm text-[#5F6660]">
                       Tap Add File above, send a Word or Excel test file to your Telegram bot, or open a shared package link from a classmate.
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => setShowUploadSheet(true)}
-                      className="min-h-[44px] px-5 py-2 rounded-xl bg-[#2F6F5E] text-white text-xs font-semibold cursor-pointer"
-                    >
-                      Upload Word or Excel File
-                    </button>
+                    <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setShowUploadSheet(true)}
+                        className="min-h-[44px] px-4 py-2 rounded-xl bg-[#2F6F5E] text-white text-xs font-semibold cursor-pointer"
+                      >
+                        Upload Word or Excel File
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowImportSheet(true)}
+                        className="min-h-[44px] px-4 py-2 rounded-xl border border-[#E6E1D6] bg-[#FBF9F5] text-[#1F2421] text-xs font-semibold cursor-pointer"
+                      >
+                        Paste Shared Link / Code
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-3">
@@ -754,7 +860,9 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
                     setSelectedCollectionId(activeDeck.collectionId);
                   }
                   setTab('decks');
-                  void fetchAllProgress(effectiveUserKey).then(setProgressMap).catch(() => {});
+                  void fetchAllProgress(getRawBrowserKey(), chatId.trim() || undefined)
+                    .then(setProgressMap)
+                    .catch(() => {});
                 }}
                 onDeckUpdated={(updated) => setActiveDeck(updated)}
                 onSharePackage={() => void handleSharePackage(activeDeck)}
@@ -923,6 +1031,67 @@ export function MiniAppView({ onSwitchToWeb }: { onSwitchToWeb?: () => void }) {
             </button>
           </form>
         </div>
+      )}
+
+      {/* Mobile Bottom Sheet for Opening a Shared Link / Code */}
+      {showImportSheet && (
+        <div className="fixed inset-0 z-50 bg-[#1F2421]/50 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <form
+            onSubmit={handleImportShared}
+            className="bg-white w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 space-y-4 border border-[#E6E1D6]"
+          >
+            <div className="w-10 h-1.5 bg-[#E6E1D6] rounded-full mx-auto sm:hidden" />
+            <div className="flex items-center justify-between">
+              <h2 className="font-display text-xl font-semibold text-[#1F2421]">
+                Open Shared Package
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowImportSheet(false)}
+                className="w-9 h-9 rounded-lg flex items-center justify-center text-[#5F6660] cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-xs text-[#5F6660] leading-relaxed">
+              Paste a shared Telegram package link or code (like <code className="font-mono">pkg_ABCD1234</code>). It will be saved permanently inside your Mini App tests.
+            </p>
+
+            <input
+              type="text"
+              value={importInput}
+              onChange={(e) => setImportInput(e.target.value)}
+              placeholder="Paste share link or pkg_... code"
+              required
+              className="w-full rounded-xl border border-[#E6E1D6] bg-[#FBF9F5] px-3.5 py-2.5 text-sm text-[#1F2421] focus:outline-none focus:border-[#2F6F5E]"
+            />
+
+            <button
+              type="submit"
+              disabled={!importInput.trim() || importingShare}
+              className="w-full h-12 rounded-xl bg-[#2F6F5E] text-white font-semibold text-sm flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+            >
+              {importingShare ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Saving to your tests...
+                </>
+              ) : (
+                'Save & Open in Mini App'
+              )}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {/* Interactive Share Sheet */}
+      {shareTarget && (
+        <ShareModal
+          target={shareTarget}
+          preferMiniAppPath={true}
+          onClose={() => setShareTarget(null)}
+        />
       )}
     </div>
   );

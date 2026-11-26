@@ -1,0 +1,222 @@
+{
+  "entities": {
+    "UserCollection": {
+      "title": "UserCollection",
+      "description": "A grouped test file uploaded or saved by a user, containing ordered 50-question packages.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "sourceFilename": { "type": "string", "maxLength": 240 },
+        "language": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "totalQuestions": { "type": "number" },
+        "packageCount": { "type": "number" },
+        "shareCode": { "type": "string", "minLength": 4, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "isSharedWithMe": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "title",
+        "language",
+        "totalQuestions",
+        "packageCount",
+        "shareCode",
+        "isSharedWithMe",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserDeck": {
+      "title": "UserDeck",
+      "description": "A single 50-question multiple-choice package belonging to a user collection.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "collectionId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "partNumber": { "type": "number" },
+        "totalParts": { "type": "number" },
+        "rangeStart": { "type": "number" },
+        "rangeEnd": { "type": "number" },
+        "shareCode": { "type": "string", "minLength": 4, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "description": { "type": "string", "maxLength": 500 },
+        "language": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "sourceFilename": { "type": "string", "maxLength": 240 },
+        "isSharedWithMe": { "type": "boolean" },
+        "questions": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "collectionId",
+        "partNumber",
+        "totalParts",
+        "rangeStart",
+        "rangeEnd",
+        "shareCode",
+        "title",
+        "description",
+        "language",
+        "isSharedWithMe",
+        "questions",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserProgress": {
+      "title": "UserProgress",
+      "description": "Auto-saved in-progress quiz state for a specific user and package.",
+      "type": "object",
+      "properties": {
+        "deckId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "mode": { "type": "string", "enum": ["quiz", "exam"] },
+        "currentIndex": { "type": "number" },
+        "selectedMap": { "type": "object" },
+        "elapsedSeconds": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "deckId",
+        "ownerUid",
+        "mode",
+        "currentIndex",
+        "selectedMap",
+        "elapsedSeconds",
+        "updatedAt"
+      ]
+    },
+    "UserAttempt": {
+      "title": "UserAttempt",
+      "description": "Completed practice or exam attempt score record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deckId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deckTitle": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "deckLanguage": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "mode": { "type": "string", "enum": ["quiz", "exam"] },
+        "source": { "type": "string", "enum": ["web", "miniapp", "telegram_chat"] },
+        "score": { "type": "number" },
+        "total": { "type": "number" },
+        "durationSeconds": { "type": "number" },
+        "completedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "deckId",
+        "deckTitle",
+        "deckLanguage",
+        "mode",
+        "source",
+        "score",
+        "total",
+        "durationSeconds",
+        "completedAt"
+      ]
+    },
+    "SharedBundle": {
+      "title": "SharedBundle",
+      "description": "Publicly resolvable (by exact share code only) metadata for a shared package or collection.",
+      "type": "object",
+      "properties": {
+        "shareCode": { "type": "string", "minLength": 4, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "kind": { "type": "string", "enum": ["deck", "collection"] },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "sourceFilename": { "type": "string", "maxLength": 240 },
+        "language": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "totalQuestions": { "type": "number" },
+        "packageCount": { "type": "number" },
+        "collectionId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "shareCode",
+        "kind",
+        "ownerUid",
+        "title",
+        "language",
+        "totalQuestions",
+        "packageCount",
+        "collectionId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SharedPackage": {
+      "title": "SharedPackage",
+      "description": "A single 50-question package stored inside a shared bundle.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "parentShareCode": { "type": "string", "minLength": 4, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "collectionId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "partNumber": { "type": "number" },
+        "totalParts": { "type": "number" },
+        "rangeStart": { "type": "number" },
+        "rangeEnd": { "type": "number" },
+        "shareCode": { "type": "string", "minLength": 4, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "description": { "type": "string", "maxLength": 500 },
+        "language": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "sourceFilename": { "type": "string", "maxLength": 240 },
+        "questions": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "parentShareCode",
+        "ownerUid",
+        "collectionId",
+        "partNumber",
+        "totalParts",
+        "rangeStart",
+        "rangeEnd",
+        "shareCode",
+        "title",
+        "description",
+        "language",
+        "questions",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/collections/{collectionId}": {
+      "schema": { "$ref": "#/entities/UserCollection" },
+      "description": "User's saved test file collections."
+    },
+    "/users/{userId}/decks/{deckId}": {
+      "schema": { "$ref": "#/entities/UserDeck" },
+      "description": "User's 50-question exam packages."
+    },
+    "/users/{userId}/progress/{deckId}": {
+      "schema": { "$ref": "#/entities/UserProgress" },
+      "description": "Auto-saved quiz answers and current question index."
+    },
+    "/users/{userId}/attempts/{attemptId}": {
+      "schema": { "$ref": "#/entities/UserAttempt" },
+      "description": "Completed quiz and timed exam scores."
+    },
+    "/shares/{shareCode}": {
+      "schema": { "$ref": "#/entities/SharedBundle" },
+      "description": "Direct-lookup shared bundle metadata keyed by unguessable shareCode."
+    },
+    "/shares/{shareCode}/packages/{deckId}": {
+      "schema": { "$ref": "#/entities/SharedPackage" },
+      "description": "Packages inside a shared bundle."
+    }
+  }
+}

@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Edit3,
   FolderOpen,
+  Link2,
   Loader2,
   Play,
   Search,
@@ -13,6 +14,7 @@ import {
   Share2,
   Trash2,
   Upload,
+  UserCheck,
   X,
 } from 'lucide-react';
 import type {
@@ -24,18 +26,19 @@ import type {
   TestCollection,
 } from './types.ts';
 import {
-  buildCollectionShareUrl,
-  buildPackageShareUrl,
+  bindTelegramId,
   deleteCollectionById,
   deleteDeckById,
+  extractShareTargetFromParams,
   fetchAllProgress,
   fetchCollectionDetail,
   fetchCollections,
   fetchDeckDetail,
   fetchJobs,
   fetchRecentAttempts,
-  fetchTelegramStatus,
+  getRawBrowserKey,
   getUserKey,
+  implementShareInput,
   implementSharedCollection,
   implementSharedDeck,
   sendQuizToTelegram,
@@ -43,6 +46,7 @@ import {
 import { DeckEditorModal } from './components/DeckEditorModal.tsx';
 import { MiniAppView } from './components/MiniAppView.tsx';
 import { PracticeRunner } from './components/PracticeRunner.tsx';
+import { ShareModal, type ShareTarget } from './components/ShareModal.tsx';
 import { TelegramHub } from './components/TelegramHub.tsx';
 import { UploadStudio } from './components/UploadStudio.tsx';
 
@@ -79,7 +83,10 @@ export default function App() {
   const [linkedChatId, setLinkedChatId] = useState<string>(
     () => localStorage.getItem('cozyprep_chat_id') || '',
   );
-  const [botUsername, setBotUsername] = useState<string | null>(null);
+  const [tgIdInput, setTgIdInput] = useState<string>(
+    () => localStorage.getItem('cozyprep_chat_id') || '',
+  );
+  const [editingTgId, setEditingTgId] = useState(false);
   const [sendModalDeck, setSendModalDeck] = useState<ExamDeck | null>(null);
   const [sendingTelegram, setSendingTelegram] = useState(false);
   const [bannerMessage, setBannerMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(
@@ -87,6 +94,10 @@ export default function App() {
   );
   const [dismissedJobIds, setDismissedJobIds] = useState<Record<string, boolean>>({});
   const [heroImgFailed, setHeroImgFailed] = useState(false);
+  const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importInput, setImportInput] = useState('');
+  const [importingShare, setImportingShare] = useState(false);
 
   const prevActiveJobIdsRef = useRef<Set<string>>(new Set());
   const effectiveUserKey = linkedChatId.trim() || getUserKey();
@@ -101,60 +112,68 @@ export default function App() {
     [collections, selectedCollectionId],
   );
 
-  async function refreshData(handleDeepLinks = false) {
+  async function refreshData(handleDeepLinks = false, overrideChatId?: string) {
     setLoadingDecks(true);
     try {
-      const cleanChat = linkedChatId.trim() || undefined;
-      const key = cleanChat || getUserKey();
+      const cleanChat = (overrideChatId !== undefined ? overrideChatId : linkedChatId).trim() || undefined;
+      const rawKey = getRawBrowserKey();
+      const progressKey = cleanChat || rawKey;
 
       if (handleDeepLinks) {
         const params = new URLSearchParams(window.location.search);
-        const shareCode = params.get('share');
-        const shareColCode = params.get('shareCol');
-        const urlCollectionId = params.get('collectionId');
-        const urlDeckId = params.get('deckId');
+        const paramTgId = params.get('tgId')?.trim();
+        let activeChat = cleanChat;
+        if (paramTgId && /^-?\d{4,20}$/.test(paramTgId)) {
+          activeChat = paramTgId;
+          setLinkedChatId(paramTgId);
+          setTgIdInput(paramTgId);
+          await bindTelegramId(paramTgId);
+        }
 
-        if (shareCode) {
+        const startParam = window.Telegram?.WebApp?.initDataUnsafe?.start_param ?? null;
+        const target = extractShareTargetFromParams(params, startParam);
+
+        if (target.shareDeckCode) {
           try {
-            const shared = await implementSharedDeck(shareCode, {
-              userKey: key,
-              chatId: cleanChat,
+            const shared = await implementSharedDeck(target.shareDeckCode, {
+              userKey: rawKey,
+              chatId: activeChat,
             });
             setActiveDeck(shared);
             setTab('practice');
             setBannerMessage({
               type: 'ok',
-              text: `Added "${shared.title}" to your tests. You can solve it anytime and resume automatically.`,
+              text: `Saved "${shared.title}" to your tests. You can solve it anytime and resume automatically.`,
             });
           } catch {
             // ignore invalid share param
           }
-        } else if (shareColCode) {
+        } else if (target.shareCollectionCode) {
           try {
-            const col = await implementSharedCollection(shareColCode, {
-              userKey: key,
-              chatId: cleanChat,
+            const col = await implementSharedCollection(target.shareCollectionCode, {
+              userKey: rawKey,
+              chatId: activeChat,
             });
             setSelectedCollectionId(col.id);
             setTab('library');
             setBannerMessage({
               type: 'ok',
-              text: `Added "${col.title}" (${col.packageCount} packages) to your library.`,
+              text: `Saved "${col.title}" (${col.packageCount} packages) to your library.`,
             });
           } catch {
             // ignore invalid shareCol param
           }
-        } else if (urlCollectionId) {
+        } else if (target.collectionId) {
           try {
-            const col = await fetchCollectionDetail(urlCollectionId);
+            const col = await fetchCollectionDetail(target.collectionId);
             setSelectedCollectionId(col.id);
             setTab('library');
           } catch {
             // ignore
           }
-        } else if (urlDeckId) {
+        } else if (target.deckId) {
           try {
-            const detail = await fetchDeckDetail(urlDeckId);
+            const detail = await fetchDeckDetail(target.deckId);
             setActiveDeck(detail);
             setTab('practice');
           } catch {
@@ -163,20 +182,17 @@ export default function App() {
         }
       }
 
-      const [colList, recent, jobList, progress, tgStatus] = await Promise.all([
-        fetchCollections({ userKey: key }),
-        fetchRecentAttempts(),
-        fetchJobs({ userKey: key, chatId: cleanChat }),
-        fetchAllProgress(key),
-        fetchTelegramStatus().catch(() => null),
+      const activeChat = (overrideChatId !== undefined ? overrideChatId : linkedChatId).trim() || undefined;
+      const [colList, recent, jobList, progress] = await Promise.all([
+        fetchCollections({ chatId: activeChat, userKey: rawKey }),
+        fetchRecentAttempts({ chatId: activeChat, userKey: rawKey }),
+        fetchJobs({ userKey: activeChat || rawKey, chatId: activeChat }),
+        fetchAllProgress(rawKey, activeChat),
       ]);
       setCollections(colList);
       setAttempts(recent);
       setJobs(jobList);
       setProgressMap(progress);
-      if (tgStatus?.botUsername) {
-        setBotUsername(tgStatus.botUsername);
-      }
     } catch {
       // handled cleanly via empty/error state
     } finally {
@@ -200,9 +216,11 @@ export default function App() {
     if (activeJobs.length === 0) return;
 
     const timer = window.setInterval(() => {
+      const cleanChat = linkedChatId.trim() || undefined;
+      const rawKey = getRawBrowserKey();
       void fetchJobs({
         userKey: effectiveUserKey,
-        chatId: linkedChatId.trim() || undefined,
+        chatId: cleanChat,
       })
         .then(async (latest) => {
           setJobs(latest);
@@ -214,8 +232,8 @@ export default function App() {
           if (newlyDone) {
             prevActiveJobIdsRef.current.delete(newlyDone.id);
             const [colList, progress] = await Promise.all([
-              fetchCollections({ userKey: effectiveUserKey }),
-              fetchAllProgress(effectiveUserKey),
+              fetchCollections({ chatId: cleanChat, userKey: rawKey }),
+              fetchAllProgress(rawKey, cleanChat),
             ]);
             setCollections(colList);
             setProgressMap(progress);
@@ -230,16 +248,21 @@ export default function App() {
           }
         })
         .catch(() => {});
-    }, 2000);
+    }, 1000);
 
     return () => window.clearInterval(timer);
   }, [jobs, isMiniAppRoute, effectiveUserKey, linkedChatId]);
 
   function handleChatIdChange(nextId: string) {
-    setLinkedChatId(nextId);
-    localStorage.setItem('cozyprep_chat_id', nextId);
-    const key = nextId.trim() || getUserKey();
-    void fetchAllProgress(key).then(setProgressMap).catch(() => {});
+    const clean = nextId.trim();
+    setLinkedChatId(clean);
+    setTgIdInput(clean);
+    if (clean) {
+      void bindTelegramId(clean).then(() => refreshData(false, clean));
+    } else {
+      localStorage.removeItem('cozyprep_chat_id');
+      void refreshData(false, '');
+    }
   }
 
   function switchToMiniApp() {
@@ -306,35 +329,50 @@ export default function App() {
     }
   }
 
-  async function handleSharePackage(deck: ExamDeck) {
-    const shareUrl = buildPackageShareUrl(deck, botUsername);
-    try {
-      await navigator.clipboard.writeText(shareUrl);
-      setBannerMessage({
-        type: 'ok',
-        text: `Package link copied! Anyone who opens it can add and solve "${deck.title}": ${shareUrl}`,
-      });
-    } catch {
-      setBannerMessage({
-        type: 'ok',
-        text: `Share link for "${deck.title}": ${shareUrl}`,
-      });
-    }
+  function handleSharePackage(deck: ExamDeck) {
+    setShareTarget({ kind: 'deck', item: deck });
   }
 
-  async function handleShareCollection(col: TestCollection) {
-    const shareUrl = buildCollectionShareUrl(col, botUsername);
+  function handleShareCollection(col: TestCollection) {
+    setShareTarget({ kind: 'collection', item: col });
+  }
+
+  async function handleImportShared(e: React.FormEvent) {
+    e.preventDefault();
+    if (!importInput.trim()) return;
+    setImportingShare(true);
+    setBannerMessage(null);
     try {
-      await navigator.clipboard.writeText(shareUrl);
-      setBannerMessage({
-        type: 'ok',
-        text: `Test link copied! Anyone who opens it gets all ${col.packageCount} package(s) of "${col.title}": ${shareUrl}`,
+      const cleanChat = linkedChatId.trim() || undefined;
+      const result = await implementShareInput(importInput.trim(), {
+        userKey: getRawBrowserKey(),
+        chatId: cleanChat,
       });
-    } catch {
+      setShowImportModal(false);
+      setImportInput('');
+      await refreshData(false);
+      if (result.kind === 'deck') {
+        setActiveDeck(result.deck);
+        setTab('practice');
+        setBannerMessage({
+          type: 'ok',
+          text: `Saved "${result.deck.title}" to your tests!`,
+        });
+      } else {
+        setSelectedCollectionId(result.collection.id);
+        setTab('library');
+        setBannerMessage({
+          type: 'ok',
+          text: `Saved "${result.collection.title}" (${result.collection.packageCount} packages) to your tests!`,
+        });
+      }
+    } catch (err) {
       setBannerMessage({
-        type: 'ok',
-        text: `Share link for "${col.title}": ${shareUrl}`,
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Could not find that shared package or code.',
       });
+    } finally {
+      setImportingShare(false);
     }
   }
 
@@ -664,15 +702,90 @@ export default function App() {
                       )}
                     </div>
 
-                    <div className="relative w-full sm:w-64">
-                      <Search className="w-4 h-4 text-[#5F6660] absolute left-3.5 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        placeholder="Search test files..."
-                        className="w-full pl-9 pr-3.5 py-2 rounded-xl border border-[#E6E1D6] bg-white text-sm text-[#1F2421] placeholder:text-[#8E948E] focus:outline-none focus:border-[#2F6F5E]"
-                      />
+                    <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
+                      {linkedChatId && !editingTgId ? (
+                        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[#ECF4F1] border border-[#2F6F5E]/25 text-xs font-medium text-[#1F2421]">
+                          <UserCheck className="w-3.5 h-3.5 text-[#2F6F5E]" />
+                          <span className="font-mono">{linkedChatId}</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTgIdInput(linkedChatId);
+                              setEditingTgId(true);
+                            }}
+                            className="text-[#2F6F5E] font-semibold hover:underline cursor-pointer"
+                          >
+                            Edit
+                          </button>
+                        </div>
+                      ) : editingTgId ? (
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            const clean = tgIdInput.trim();
+                            if (clean && !/^-?\d{4,20}$/.test(clean)) {
+                              setBannerMessage({
+                                type: 'err',
+                                text: 'Please enter a valid numeric Telegram ID (e.g. 123456789).',
+                              });
+                              return;
+                            }
+                            setEditingTgId(false);
+                            handleChatIdChange(clean);
+                          }}
+                          className="inline-flex items-center gap-1.5"
+                        >
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={tgIdInput}
+                            onChange={(e) => setTgIdInput(e.target.value)}
+                            placeholder="Telegram ID"
+                            className="w-36 px-3 py-1.5 rounded-xl border border-[#E6E1D6] bg-white font-mono text-xs text-[#1F2421] focus:outline-none focus:border-[#2F6F5E]"
+                          />
+                          <button
+                            type="submit"
+                            className="px-3 py-1.5 rounded-xl bg-[#2F6F5E] text-white text-xs font-semibold cursor-pointer"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingTgId(false)}
+                            aria-label="Cancel Telegram ID edit"
+                            className="p-1.5 rounded-lg text-[#5F6660] hover:bg-[#EFECE4] cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </form>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setEditingTgId(true)}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-[#2F6F5E]/35 bg-[#ECF4F1] text-xs font-semibold text-[#2F6F5E] hover:bg-[#DFECE7] whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <UserCheck className="w-3.5 h-3.5" />
+                          Sync Telegram ID
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setShowImportModal(true)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-[#E6E1D6] bg-white text-xs font-semibold text-[#2F6F5E] hover:bg-[#ECF4F1] whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <Link2 className="w-3.5 h-3.5" />
+                        Open Shared Link
+                      </button>
+                      <div className="relative flex-1 sm:w-60">
+                        <Search className="w-4 h-4 text-[#5F6660] absolute left-3.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          placeholder="Search test files..."
+                          className="w-full pl-9 pr-3.5 py-2 rounded-xl border border-[#E6E1D6] bg-white text-sm text-[#1F2421] placeholder:text-[#8E948E] focus:outline-none focus:border-[#2F6F5E]"
+                        />
+                      </div>
                     </div>
                   </div>
 
@@ -998,7 +1111,9 @@ export default function App() {
                     setSelectedCollectionId(activeDeck.collectionId);
                   }
                   setTab('library');
-                  void fetchAllProgress(effectiveUserKey).then(setProgressMap).catch(() => {});
+                  void fetchAllProgress(getRawBrowserKey(), linkedChatId.trim() || undefined)
+                    .then(setProgressMap)
+                    .catch(() => {});
                 }}
                 onDeckUpdated={(updated) => setActiveDeck(updated)}
                 onSharePackage={() => void handleSharePackage(activeDeck)}
@@ -1121,6 +1236,74 @@ export default function App() {
             </div>
           </form>
         </div>
+      )}
+
+      {/* Open Shared Link / Code Modal */}
+      {showImportModal && (
+        <div className="fixed inset-0 z-50 bg-[#1F2421]/45 backdrop-blur-xs flex items-center justify-center p-4">
+          <form
+            onSubmit={handleImportShared}
+            className="bg-white border border-[#E6E1D6] rounded-2xl w-full max-w-md p-6 space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="font-display text-xl font-semibold text-[#1F2421]">
+                Open Shared Package
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowImportModal(false)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-[#5F6660] hover:bg-[#EFECE4] cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-sm text-[#5F6660]">
+              Paste a shared package link or share code (such as <code className="font-mono">pkg_ABCD1234</code>). It will be saved to your tests and synced to your Mini App.
+            </p>
+
+            <input
+              type="text"
+              value={importInput}
+              onChange={(e) => setImportInput(e.target.value)}
+              placeholder="Paste share link or pkg_... code"
+              required
+              className="w-full rounded-xl border border-[#E6E1D6] bg-[#FBF9F5] px-3.5 py-2.5 text-sm text-[#1F2421] focus:outline-none focus:border-[#2F6F5E]"
+            />
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowImportModal(false)}
+                className="px-4 py-2 rounded-xl border border-[#E6E1D6] text-xs font-semibold text-[#5F6660] cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!importInput.trim() || importingShare}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[#2F6F5E] text-white text-xs font-semibold hover:bg-[#25594B] disabled:opacity-50 cursor-pointer"
+              >
+                {importingShare ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  'Save & Open'
+                )}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Interactive Share Modal */}
+      {shareTarget && (
+        <ShareModal
+          target={shareTarget}
+          onClose={() => setShareTarget(null)}
+        />
       )}
     </div>
   );

@@ -147,12 +147,16 @@ function ensureColumn(table: string, column: string, definition: string) {
 }
 
 ensureColumn('collections', 'share_code', 'TEXT');
+ensureColumn('collections', 'user_key', 'TEXT');
 ensureColumn('decks', 'collection_id', 'TEXT');
 ensureColumn('decks', 'part_number', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('decks', 'total_parts', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('decks', 'range_start', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('decks', 'range_end', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('decks', 'share_code', 'TEXT');
+ensureColumn('decks', 'user_key', 'TEXT');
+ensureColumn('attempts', 'user_key', 'TEXT');
+ensureColumn('attempts', 'telegram_chat_id', 'TEXT');
 
 function generateShareCode(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -180,8 +184,8 @@ for (const r of missingColShareRows) {
 }
 
 // Remove the legacy starter Cell Biology sample deck if it exists so new users start clean
-db.prepare("DELETE FROM decks WHERE source_filename = 'starter-biology-sample.xlsx'").run();
-db.prepare("DELETE FROM collections WHERE source_filename = 'starter-biology-sample.xlsx'").run();
+db.prepare("DELETE FROM decks WHERE source_filename LIKE 'starter-biology-sample%' OR title = 'Cell Biology & Respiration Basics'").run();
+db.prepare("DELETE FROM collections WHERE source_filename LIKE 'starter-biology-sample%' OR title = 'Cell Biology & Respiration Basics'").run();
 
 export interface TelegramSession {
   chatId: string;
@@ -214,6 +218,7 @@ export interface CreateDeckInput {
   language: string;
   sourceFilename?: string | null;
   telegramChatId?: string | null;
+  userKey?: string | null;
   questions: QuestionDraft[];
 }
 
@@ -247,9 +252,9 @@ export function createDeck(input: CreateDeckInput): DeckDetail {
   const insertDeck = db.prepare(`
     INSERT INTO decks (
       id, collection_id, part_number, total_parts, range_start, range_end, share_code,
-      title, description, language, question_type, source_filename, telegram_chat_id, created_at
+      title, description, language, question_type, source_filename, telegram_chat_id, user_key, created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'multiple_choice', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'multiple_choice', ?, ?, ?, ?)
   `);
 
   const insertQuestion = db.prepare(`
@@ -271,6 +276,7 @@ export function createDeck(input: CreateDeckInput): DeckDetail {
       input.language.trim() || 'Original',
       input.sourceFilename ?? null,
       input.telegramChatId ?? null,
+      input.userKey ?? null,
       createdAt,
     );
 
@@ -297,6 +303,7 @@ export function createPackagedCollection(input: {
   language: string;
   sourceFilename?: string | null;
   telegramChatId?: string | null;
+  userKey?: string | null;
   questions: QuestionDraft[];
 }): { collectionId: string; packages: DeckDetail[] } {
   const PACKAGE_SIZE = 50;
@@ -308,8 +315,8 @@ export function createPackagedCollection(input: {
   const collectionShareCode = generateShareCode();
 
   db.prepare(`
-    INSERT INTO collections (id, title, source_filename, language, total_questions, package_count, share_code, telegram_chat_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO collections (id, title, source_filename, language, total_questions, package_count, share_code, telegram_chat_id, user_key, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     collectionId,
     input.title.trim() || 'Exam Collection',
@@ -319,6 +326,7 @@ export function createPackagedCollection(input: {
     totalParts,
     collectionShareCode,
     input.telegramChatId ?? null,
+    input.userKey ?? null,
     createdAt,
   );
 
@@ -342,6 +350,7 @@ export function createPackagedCollection(input: {
       language: input.language,
       sourceFilename: input.sourceFilename,
       telegramChatId: input.telegramChatId,
+      userKey: input.userKey,
       questions: slice,
     });
     packages.push(pkg);
@@ -407,9 +416,14 @@ export function listDecks(filters?: {
   if (chatId) {
     const placeholders = keys.map(() => '?').join(', ');
     where.push(
-      `(d.telegram_chat_id = ? OR EXISTS (SELECT 1 FROM user_saved_decks usd WHERE usd.deck_id = d.id AND usd.user_key IN (${placeholders})))`,
+      `(d.telegram_chat_id = ? OR d.user_key IN (${placeholders}) OR EXISTS (SELECT 1 FROM user_saved_decks usd WHERE usd.deck_id = d.id AND usd.user_key IN (${placeholders})))`,
     );
-    params.push(chatId, ...keys);
+    params.push(chatId, ...keys, ...keys);
+  } else if (userKey) {
+    where.push(
+      `(d.user_key = ? OR d.telegram_chat_id = ? OR EXISTS (SELECT 1 FROM user_saved_decks usd WHERE usd.deck_id = d.id AND usd.user_key = ?) OR (d.telegram_chat_id IS NULL AND d.user_key IS NULL))`,
+    );
+    params.push(userKey, userKey, userKey);
   }
 
   if (filters?.search && filters.search.trim()) {
@@ -444,6 +458,7 @@ export function listDecks(filters?: {
         d.language,
         d.source_filename,
         d.telegram_chat_id,
+        d.user_key,
         d.created_at,
         (SELECT COUNT(*) FROM questions q WHERE q.deck_id = d.id) as question_count
       FROM decks d
@@ -463,6 +478,7 @@ export function listDecks(filters?: {
     language: string;
     source_filename: string | null;
     telegram_chat_id: string | null;
+    user_key: string | null;
     created_at: string;
     question_count: number;
   }>;
@@ -481,7 +497,9 @@ export function listDecks(filters?: {
       | undefined;
 
     const isSharedWithMe =
-      savedSet.has(row.id) && (!chatId || row.telegram_chat_id !== chatId);
+      savedSet.has(row.id) &&
+      !(chatId && row.telegram_chat_id === chatId) &&
+      !(userKey && row.user_key === userKey);
 
     return {
       id: row.id,
@@ -577,17 +595,28 @@ export function getCollectionById(collectionId: string): TestCollection | null {
   return all.find((c) => c.id === collectionId) ?? null;
 }
 
-export function getCollectionByShareCode(shareCode: string): TestCollection | null {
-  const code = shareCode.trim().toUpperCase();
-  const row = db
-    .prepare('SELECT id FROM collections WHERE UPPER(share_code) = ?')
-    .get(code) as { id: string } | undefined;
-  if (row) {
-    return getCollectionById(row.id);
+function normalizeShareCode(raw: string): string {
+  let clean = raw.trim();
+  const match = clean.match(/(?:pkg_|col_|share=|shareCol=|start=|startapp=)([A-Za-z0-9_-]+)/i);
+  if (match && match[1]) {
+    clean = match[1];
   }
-  const byDeck = getDeckByShareCode(code);
-  if (byDeck && byDeck.collectionId) {
-    return getCollectionById(byDeck.collectionId);
+  return clean.replace(/^(?:pkg_|col_)/i, '').trim().toUpperCase();
+}
+
+export function getCollectionByShareCode(shareCode: string): TestCollection | null {
+  const code = normalizeShareCode(shareCode);
+  if (!code) return null;
+  const row = db
+    .prepare('SELECT id FROM collections WHERE UPPER(share_code) = ? OR UPPER(id) = ?')
+    .get(code, code) as { id: string } | undefined;
+  if (row) {
+    const col = getCollectionById(row.id);
+    if (col) return col;
+  }
+  const byDeck = getDeckByShareCode(shareCode);
+  if (byDeck) {
+    return getCollectionById(byDeck.collectionId || byDeck.id);
   }
   return null;
 }
@@ -723,9 +752,11 @@ export function getDeckById(deckId: string): DeckDetail | null {
 }
 
 export function getDeckByShareCode(shareCode: string): DeckDetail | null {
+  const code = normalizeShareCode(shareCode);
+  if (!code) return null;
   const row = db
-    .prepare('SELECT id FROM decks WHERE UPPER(share_code) = ?')
-    .get(shareCode.trim().toUpperCase()) as { id: string } | undefined;
+    .prepare('SELECT id FROM decks WHERE UPPER(share_code) = ? OR UPPER(id) = ?')
+    .get(code, code) as { id: string } | undefined;
   return row ? getDeckById(row.id) : null;
 }
 
@@ -823,6 +854,8 @@ export function deleteDeck(deckId: string): boolean {
 
 export function recordAttempt(input: {
   deckId: string;
+  userKey?: string | null;
+  telegramChatId?: string | null;
   mode: StudyMode;
   source: PracticeSource;
   score: number;
@@ -834,11 +867,13 @@ export function recordAttempt(input: {
   const completedAt = new Date().toISOString();
 
   db.prepare(`
-    INSERT INTO attempts (id, deck_id, mode, source, score, total, duration_seconds, answers_json, completed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO attempts (id, deck_id, user_key, telegram_chat_id, mode, source, score, total, duration_seconds, answers_json, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     input.deckId,
+    input.userKey ?? null,
+    input.telegramChatId ?? null,
     input.mode,
     input.source,
     input.score,
@@ -861,17 +896,40 @@ export function recordAttempt(input: {
   };
 }
 
-export function getRecentAttempts(limit = 30): Array<Attempt & { deckTitle: string; deckLanguage: string }> {
+export function getRecentAttempts(
+  limit = 30,
+  filters?: { chatId?: string; userKey?: string },
+): Array<Attempt & { deckTitle: string; deckLanguage: string }> {
+  const chatId = filters?.chatId?.trim();
+  const userKey = filters?.userKey?.trim();
+  const keys = Array.from(new Set([chatId, userKey].filter((v): v is string => Boolean(v))));
+
+  const whereParts: string[] = [];
+  const params: unknown[] = [];
+
+  if (chatId) {
+    const placeholders = keys.map(() => '?').join(', ');
+    whereParts.push(`(a.telegram_chat_id = ? OR a.user_key IN (${placeholders}))`);
+    params.push(chatId, ...keys);
+  } else if (userKey) {
+    whereParts.push(`(a.user_key = ? OR a.telegram_chat_id = ? OR (a.user_key IS NULL AND a.telegram_chat_id IS NULL))`);
+    params.push(userKey, userKey);
+  }
+
+  const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+  params.push(limit);
+
   const rows = db
     .prepare(`
       SELECT a.id, a.deck_id, a.mode, a.source, a.score, a.total, a.duration_seconds, a.answers_json, a.completed_at,
              d.title as deck_title, d.language as deck_language
       FROM attempts a
       JOIN decks d ON d.id = a.deck_id
+      ${whereClause}
       ORDER BY a.completed_at DESC
       LIMIT ?
     `)
-    .all(limit) as Array<{
+    .all(...params) as Array<{
     id: string;
     deck_id: string;
     mode: StudyMode;
@@ -1034,14 +1092,24 @@ export function saveQuizProgress(input: {
   return getQuizProgress(input.deckId, input.userKey)!;
 }
 
-export function getQuizProgress(deckId: string, userKey: string): QuizProgress | null {
+export function getQuizProgress(
+  deckId: string,
+  userKey: string,
+  chatId?: string,
+): QuizProgress | null {
+  const keys = Array.from(new Set([chatId?.trim(), userKey.trim()].filter((v): v is string => Boolean(v))));
+  if (keys.length === 0) return null;
+  const placeholders = keys.map(() => '?').join(', ');
+
   const row = db
     .prepare(`
       SELECT deck_id, user_key, mode, current_index, answers_map_json, elapsed_seconds, updated_at
       FROM quiz_progress
-      WHERE deck_id = ? AND user_key = ?
+      WHERE deck_id = ? AND user_key IN (${placeholders})
+      ORDER BY updated_at DESC
+      LIMIT 1
     `)
-    .get(deckId, userKey) as
+    .get(deckId, ...keys) as
     | {
         deck_id: string;
         user_key: string;
@@ -1066,17 +1134,25 @@ export function getQuizProgress(deckId: string, userKey: string): QuizProgress |
   };
 }
 
-export function listProgressForUser(userKey: string): Record<
+export function listProgressForUser(
+  userKey: string,
+  chatId?: string,
+): Record<
   string,
   { currentIndex: number; answeredCount: number; mode: StudyMode; updatedAt: string }
 > {
+  const keys = Array.from(new Set([chatId?.trim(), userKey.trim()].filter((v): v is string => Boolean(v))));
+  if (keys.length === 0) return {};
+  const placeholders = keys.map(() => '?').join(', ');
+
   const rows = db
     .prepare(`
       SELECT deck_id, mode, current_index, answers_map_json, updated_at
       FROM quiz_progress
-      WHERE user_key = ?
+      WHERE user_key IN (${placeholders})
+      ORDER BY updated_at ASC
     `)
-    .all(userKey) as Array<{
+    .all(...keys) as Array<{
     deck_id: string;
     mode: StudyMode;
     current_index: number;
@@ -1103,8 +1179,71 @@ export function listProgressForUser(userKey: string): Record<
   return map;
 }
 
-export function clearQuizProgress(deckId: string, userKey: string): void {
-  db.prepare('DELETE FROM quiz_progress WHERE deck_id = ? AND user_key = ?').run(deckId, userKey);
+export function clearQuizProgress(deckId: string, userKey: string, chatId?: string): void {
+  const keys = Array.from(new Set([chatId?.trim(), userKey.trim()].filter((v): v is string => Boolean(v))));
+  if (keys.length === 0) return;
+  const placeholders = keys.map(() => '?').join(', ');
+  db.prepare(`DELETE FROM quiz_progress WHERE deck_id = ? AND user_key IN (${placeholders})`).run(
+    deckId,
+    ...keys,
+  );
+}
+
+export function bindUserKeyToTelegramId(userKey: string, chatId: string): void {
+  const cleanKey = userKey.trim();
+  const cleanChat = chatId.trim();
+  if (!cleanKey || !cleanChat || cleanKey === cleanChat) return;
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      "UPDATE collections SET telegram_chat_id = ? WHERE user_key = ? AND (telegram_chat_id IS NULL OR telegram_chat_id = '')",
+    ).run(cleanChat, cleanKey);
+    db.prepare(
+      "UPDATE decks SET telegram_chat_id = ? WHERE user_key = ? AND (telegram_chat_id IS NULL OR telegram_chat_id = '')",
+    ).run(cleanChat, cleanKey);
+    db.prepare(
+      "UPDATE jobs SET telegram_chat_id = ? WHERE user_key = ? AND (telegram_chat_id IS NULL OR telegram_chat_id = '')",
+    ).run(cleanChat, cleanKey);
+    db.prepare(
+      "UPDATE attempts SET telegram_chat_id = ? WHERE user_key = ? AND (telegram_chat_id IS NULL OR telegram_chat_id = '')",
+    ).run(cleanChat, cleanKey);
+
+    const savedRows = db
+      .prepare('SELECT deck_id, saved_at FROM user_saved_decks WHERE user_key = ?')
+      .all(cleanKey) as Array<{ deck_id: string; saved_at: string }>;
+    const insertSaved = db.prepare(
+      'INSERT INTO user_saved_decks (user_key, deck_id, saved_at) VALUES (?, ?, ?) ON CONFLICT(user_key, deck_id) DO NOTHING',
+    );
+    for (const r of savedRows) {
+      insertSaved.run(cleanChat, r.deck_id, r.saved_at);
+    }
+
+    const progRows = db
+      .prepare('SELECT deck_id, mode, current_index, answers_map_json, elapsed_seconds, updated_at FROM quiz_progress WHERE user_key = ?')
+      .all(cleanKey) as Array<{
+      deck_id: string;
+      mode: StudyMode;
+      current_index: number;
+      answers_map_json: string;
+      elapsed_seconds: number;
+      updated_at: string;
+    }>;
+    const upsertProg = db.prepare(`
+      INSERT INTO quiz_progress (deck_id, user_key, mode, current_index, answers_map_json, elapsed_seconds, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(deck_id, user_key) DO UPDATE SET
+        mode = CASE WHEN excluded.updated_at > quiz_progress.updated_at THEN excluded.mode ELSE quiz_progress.mode END,
+        current_index = CASE WHEN excluded.updated_at > quiz_progress.updated_at THEN excluded.current_index ELSE quiz_progress.current_index END,
+        answers_map_json = CASE WHEN excluded.updated_at > quiz_progress.updated_at THEN excluded.answers_map_json ELSE quiz_progress.answers_map_json END,
+        elapsed_seconds = CASE WHEN excluded.updated_at > quiz_progress.updated_at THEN excluded.elapsed_seconds ELSE quiz_progress.elapsed_seconds END,
+        updated_at = CASE WHEN excluded.updated_at > quiz_progress.updated_at THEN excluded.updated_at ELSE quiz_progress.updated_at END
+    `);
+    for (const p of progRows) {
+      upsertProg.run(p.deck_id, cleanChat, p.mode, p.current_index, p.answers_map_json, p.elapsed_seconds, p.updated_at);
+    }
+  });
+
+  tx();
 }
 
 // --- Telegram Sessions & Link Codes ---
@@ -1253,5 +1392,161 @@ export function getLinkStatus(code: string): {
     chatId: row.chat_id,
     username: row.username,
     firstName: row.first_name,
+  };
+}
+
+export function upsertShareBundleToDb(input: {
+  collection?: Partial<TestCollection> | null;
+  packages: DeckDetail[];
+  userKey?: string | null;
+  telegramChatId?: string | null;
+}): { collection: TestCollection | null; packages: DeckDetail[] } {
+  const validPkgs = (input.packages || []).filter(
+    (p) => p && typeof p.id === 'string' && p.id.trim() && Array.isArray(p.questions) && p.questions.length > 0,
+  );
+  if (validPkgs.length === 0) {
+    return { collection: null, packages: [] };
+  }
+
+  const now = new Date().toISOString();
+  const cleanChatId = input.telegramChatId?.trim() || null;
+  const cleanUserKey = input.userKey?.trim() || cleanChatId || null;
+
+  const firstPkg = validPkgs[0];
+  const rawColId = (input.collection?.id || firstPkg.collectionId || '').trim();
+  const isRealCollection = Boolean(rawColId && !rawColId.startsWith('single_'));
+  let targetColId: string | null = isRealCollection ? rawColId : null;
+
+  const insertColStmt = db.prepare(`
+    INSERT INTO collections (
+      id, title, source_filename, language, total_questions, package_count,
+      share_code, telegram_chat_id, user_key, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const insertDeckStmt = db.prepare(`
+    INSERT INTO decks (
+      id, collection_id, part_number, total_parts, range_start, range_end, share_code,
+      title, description, language, question_type, source_filename, telegram_chat_id, user_key, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'multiple_choice', ?, ?, ?, ?)
+  `);
+
+  const insertQuestionStmt = db.prepare(`
+    INSERT INTO questions (id, deck_id, order_index, prompt, options_json, correct_index, explanation, format)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'multiple_choice')
+  `);
+
+  const savedDeckIds: string[] = [];
+
+  const tx = db.transaction(() => {
+    if (targetColId) {
+      const desiredColShare = (input.collection?.shareCode || '').trim().toUpperCase() || generateShareCode();
+      const existingCol = db
+        .prepare('SELECT id FROM collections WHERE id = ? OR UPPER(share_code) = ?')
+        .get(targetColId, desiredColShare) as { id: string } | undefined;
+
+      if (existingCol) {
+        targetColId = existingCol.id;
+      } else {
+        const totalQ = validPkgs.reduce((s, p) => s + p.questions.length, 0);
+        insertColStmt.run(
+          targetColId,
+          (input.collection?.title || firstPkg.title || 'Shared Test').trim().slice(0, 240),
+          input.collection?.sourceFilename ?? firstPkg.sourceFilename ?? null,
+          (input.collection?.language || firstPkg.language || 'Original').trim() || 'Original',
+          totalQ,
+          validPkgs.length,
+          desiredColShare,
+          cleanChatId,
+          cleanUserKey,
+          input.collection?.createdAt || firstPkg.createdAt || now,
+        );
+      }
+    }
+
+    for (let i = 0; i < validPkgs.length; i++) {
+      const pkg = validPkgs[i];
+      const desiredShare = (pkg.shareCode || '').trim().toUpperCase() || generateShareCode();
+      const existingDeck = db
+        .prepare('SELECT id FROM decks WHERE id = ? OR UPPER(share_code) = ?')
+        .get(pkg.id, desiredShare) as { id: string } | undefined;
+
+      let activeDeckId = pkg.id;
+      if (existingDeck) {
+        activeDeckId = existingDeck.id;
+        const countRow = db
+          .prepare('SELECT COUNT(*) as cnt FROM questions WHERE deck_id = ?')
+          .get(activeDeckId) as { cnt: number };
+        if (countRow.cnt === 0) {
+          pkg.questions.forEach((q, idx) => {
+            insertQuestionStmt.run(
+              q.id || crypto.randomUUID(),
+              activeDeckId,
+              typeof q.orderIndex === 'number' ? q.orderIndex : idx,
+              String(q.prompt || '').trim(),
+              JSON.stringify(Array.isArray(q.options) ? q.options : []),
+              Math.max(0, Number(q.correctIndex ?? 0)),
+              String(q.explanation || '').trim(),
+            );
+          });
+        }
+      } else {
+        const pkgColId = targetColId || (pkg.collectionId && !pkg.collectionId.startsWith('single_') ? pkg.collectionId : null);
+        insertDeckStmt.run(
+          activeDeckId,
+          pkgColId,
+          pkg.partNumber || i + 1,
+          pkg.totalParts || validPkgs.length,
+          pkg.rangeStart || 1,
+          pkg.rangeEnd || pkg.questions.length,
+          desiredShare,
+          (pkg.title || 'Exam Package').trim().slice(0, 240),
+          (pkg.description || '').trim(),
+          (pkg.language || 'Original').trim() || 'Original',
+          pkg.sourceFilename ?? null,
+          cleanChatId,
+          cleanUserKey,
+          pkg.createdAt || now,
+        );
+
+        pkg.questions.forEach((q, idx) => {
+          insertQuestionStmt.run(
+            q.id || crypto.randomUUID(),
+            activeDeckId,
+            typeof q.orderIndex === 'number' ? q.orderIndex : idx,
+            String(q.prompt || '').trim(),
+            JSON.stringify(Array.isArray(q.options) ? q.options : []),
+            Math.max(0, Number(q.correctIndex ?? 0)),
+            String(q.explanation || '').trim(),
+          );
+        });
+      }
+
+      if (cleanUserKey) {
+        saveSharedDeckForUser(cleanUserKey, activeDeckId);
+      }
+      if (cleanChatId && cleanChatId !== cleanUserKey) {
+        saveSharedDeckForUser(cleanChatId, activeDeckId);
+      }
+      savedDeckIds.push(activeDeckId);
+    }
+  });
+
+  tx();
+
+  const savedPackages = savedDeckIds
+    .map((id) => getDeckById(id))
+    .filter((d): d is DeckDetail => Boolean(d));
+  const resolvedCol = targetColId
+    ? getCollectionById(targetColId)
+    : savedPackages[0]
+      ? getCollectionById(savedPackages[0].id)
+      : null;
+
+  return {
+    collection: resolvedCol,
+    packages: savedPackages,
   };
 }

@@ -108,6 +108,7 @@ export interface TelegramStatus {
   botFirstName: string | null;
   webhookUrl: string | null;
   webhookRegistered: boolean;
+  webhookMatchesCurrentApp?: boolean;
   miniAppUrl: string;
   lastError?: string | null;
 }
